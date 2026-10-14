@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"runtime"
 	"runtime/debug"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,11 +24,17 @@ import (
 )
 
 var envMaxWorkers = 1
+var envShutdownTimeoutSeconds = 30
 
 func init() {
 	envMaxWorkers = xenv.GetOrDefaultInt("CERTIMATE_WORKFLOW_MAX_WORKERS", runtime.GOMAXPROCS(0))
 	if envMaxWorkers <= 0 {
 		envMaxWorkers = max(1, runtime.NumCPU())
+	}
+
+	envShutdownTimeoutSeconds = xenv.GetOrDefaultInt("CERTIMATE_WORKFLOW_SHUTDOWN_TIMEOUT_SECONDS", envShutdownTimeoutSeconds)
+	if envShutdownTimeoutSeconds <= 0 {
+		envShutdownTimeoutSeconds = 30
 	}
 }
 
@@ -35,8 +43,17 @@ type WorkflowDispatcher interface {
 
 	Bootup(ctx context.Context) error
 	Shutdown(ctx context.Context) error
-	Start(ctx context.Context, runId string) error
+	Start(ctx context.Context, workflowId string, runId string) error
 	Cancel(ctx context.Context, runId string) error
+
+	// ShutdownWorkflow closes the ownership of a single workflow: it rejects
+	// new runs, withdraws queued runs, cancels in-flight executions (and their
+	// child processes) and waits until all of its execution goroutines have
+	// converged. It is idempotent and safe to retry.
+	ShutdownWorkflow(ctx context.Context, workflowId string) error
+	// ReleaseWorkflow clears the in-memory close fence after the workflow
+	// record has been committed to deletion.
+	ReleaseWorkflow(workflowId string)
 }
 
 type Statistics struct {
@@ -49,9 +66,11 @@ type workflowDispatcher struct {
 	booted      bool
 	concurrency int
 
-	taskMtx         sync.RWMutex
-	pendingRunQueue []string
-	processingTasks map[string]*taskInfo // Key: RunId
+	taskMtx          sync.RWMutex
+	pendingRunQueue  []*taskInfo
+	processingTasks  map[string]*taskInfo // Key: RunId, removed as soon as a slot is freed
+	activeTasks      map[string]*taskInfo // Key: RunId, removed only once the execution goroutine has fully exited
+	closingWorkflows map[string]struct{} // Key: WorkflowId
 
 	workflowRepo    workflowRepository
 	workflowRunRepo workflowRunRepository
@@ -71,8 +90,8 @@ func (wd *workflowDispatcher) GetStatistics() Statistics {
 		PendingRunIds:    make([]string, 0),
 		ProcessingRunIds: make([]string, 0),
 	}
-	for _, pendingRunId := range wd.pendingRunQueue {
-		stats.PendingRunIds = append(stats.PendingRunIds, pendingRunId)
+	for _, pendingTask := range wd.pendingRunQueue {
+		stats.PendingRunIds = append(stats.PendingRunIds, pendingTask.RunId)
 	}
 	for _, processingRunId := range wd.processingTasks {
 		stats.ProcessingRunIds = append(stats.ProcessingRunIds, processingRunId.RunId)
@@ -112,29 +131,127 @@ func (wd *workflowDispatcher) Shutdown(ctx context.Context) error {
 	}
 
 	wd.booted = false
-	wd.pendingRunQueue = make([]string, 0)
+	wd.pendingRunQueue = make([]*taskInfo, 0)
 	wd.processingTasks = make(map[string]*taskInfo)
+	wd.activeTasks = make(map[string]*taskInfo)
+	wd.closingWorkflows = make(map[string]struct{})
 	return nil
 }
 
-func (wd *workflowDispatcher) Start(ctx context.Context, runId string) error {
+func (wd *workflowDispatcher) Start(ctx context.Context, workflowId string, runId string) error {
 	wd.taskMtx.Lock()
 	defer wd.taskMtx.Unlock()
+
+	if !wd.booted {
+		return fmt.Errorf("workflow dispatcher is not booted")
+	}
+
+	// Close fence: once the ownership of a workflow is closing, no further
+	// generation may enter the queue, regardless of who requested the run.
+	if _, closing := wd.closingWorkflows[workflowId]; closing {
+		return fmt.Errorf("workflow #%s is closing, the new run #%s is rejected", workflowId, runId)
+	}
 
 	if _, exists := wd.processingTasks[runId]; exists {
 		return fmt.Errorf("workflow run %s is already processing", runId)
 	}
 
-	for _, pendingRunId := range wd.pendingRunQueue {
-		if pendingRunId == runId {
+	for _, pendingTask := range wd.pendingRunQueue {
+		if pendingTask.RunId == runId {
 			return fmt.Errorf("workflow run %s is already in the queue", runId)
 		}
 	}
 
-	wd.pendingRunQueue = append(wd.pendingRunQueue, runId)
+	wd.pendingRunQueue = append(wd.pendingRunQueue, &taskInfo{WorkflowId: workflowId, RunId: runId})
 	go func() { wd.tryNextAsync() }()
 
 	return nil
+}
+
+func (wd *workflowDispatcher) ShutdownWorkflow(ctx context.Context, workflowId string) error {
+	// 1. Raise the close fence, withdraw queued generations and cancel every
+	//    in-flight execution atomically. Cancelling here (before any slow
+	//    database work) guarantees that no node can cross the close boundary
+	//    and publish a certificate/output or trigger a deploy/notification.
+	wd.taskMtx.Lock()
+	wd.closingWorkflows[workflowId] = struct{}{}
+
+	inflightTasks := make([]*taskInfo, 0)
+	for _, task := range wd.activeTasks {
+		if task.WorkflowId == workflowId {
+			inflightTasks = append(inflightTasks, task)
+			task.cancel()
+		}
+	}
+
+	// Withdraw every queued generation of this workflow. Their database status
+	// is corrected by the cancel sweep below, so they can never be dispatched.
+	wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(task *taskInfo, _ int) bool {
+		return task.WorkflowId != workflowId
+	})
+	wd.taskMtx.Unlock()
+
+	// 2. Database-side fence: mark every still active run as canceled. This
+	//    also covers generations whose row was inserted but that were rejected
+	//    by the in-memory fence above.
+	canceledRuns, err := wd.workflowRunRepo.CancelActiveByWorkflowId(ctx, workflowId)
+	if err != nil {
+		return fmt.Errorf("workflow #%s: failed to cancel active runs while closing: %w", workflowId, err)
+	}
+	for _, run := range canceledRuns {
+		wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s was canceled because the workflow is closing", workflowId, run.Id))
+	}
+
+	// 3. Wait for ownership convergence. The wait is intentionally detached
+	//    from the request context so a client disconnect cannot split the
+	//    state halfway, but it is bounded to avoid blocking forever.
+	waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(envShutdownTimeoutSeconds)*time.Second)
+	defer waitCancel()
+
+	for _, task := range inflightTasks {
+		select {
+		case <-task.done:
+		case <-waitCtx.Done():
+			runningRunIds := wd.activeRunIds(workflowId)
+			return fmt.Errorf("workflow #%s: timed out waiting for %d active run(s) to stop [%s]; the deletion has been aborted and can be retried",
+				workflowId, len(runningRunIds), strings.Join(runningRunIds, ","))
+		}
+	}
+
+	// 4. Final sweep: any active row left means a generation slipped in
+	//    concurrently; abort rather than committing a split state.
+	leftRuns, err := wd.workflowRunRepo.CancelActiveByWorkflowId(ctx, workflowId)
+	if err != nil {
+		return fmt.Errorf("workflow #%s: failed to verify active runs while closing: %w", workflowId, err)
+	}
+	if len(leftRuns) > 0 {
+		runningRunIds := lo.Map(leftRuns, func(run *domain.WorkflowRun, _ int) string { return run.Id })
+		return fmt.Errorf("workflow #%s: %d active run(s) are still present [%s]; the deletion has been aborted and can be retried",
+			workflowId, len(runningRunIds), strings.Join(runningRunIds, ","))
+	}
+
+	return nil
+}
+
+func (wd *workflowDispatcher) ReleaseWorkflow(workflowId string) {
+	wd.taskMtx.Lock()
+	defer wd.taskMtx.Unlock()
+
+	delete(wd.closingWorkflows, workflowId)
+}
+
+func (wd *workflowDispatcher) activeRunIds(workflowId string) []string {
+	wd.taskMtx.RLock()
+	defer wd.taskMtx.RUnlock()
+
+	runIds := make([]string, 0)
+	for _, task := range wd.activeTasks {
+		if task.WorkflowId == workflowId {
+			runIds = append(runIds, task.RunId)
+		}
+	}
+	slices.Sort(runIds)
+	return runIds
 }
 
 func (wd *workflowDispatcher) Cancel(ctx context.Context, runId string) error {
@@ -173,8 +290,8 @@ func (wd *workflowDispatcher) Cancel(ctx context.Context, runId string) error {
 		wd.syslog.Info(fmt.Sprintf("workrun #%s was canceled", task.RunId))
 	}
 
-	for i, pendingRunId := range wd.pendingRunQueue {
-		if pendingRunId == runId {
+	for i, pendingTask := range wd.pendingRunQueue {
+		if pendingTask.RunId == runId {
 			wd.pendingRunQueue = append(wd.pendingRunQueue[:i], wd.pendingRunQueue[i+1:]...)
 			break
 		}
@@ -207,13 +324,17 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
 		}
 	}()
 
-	// 尝试继续执行等待队列中的任务
+	// 尝试继续执行等待队列中的任务；activeTasks 与 done 仅在执行协程完全
+	// 退出（含所有收尾回调）后才释放/关闭，ShutdownWorkflow 据此等待所有权收敛
 	defer func() {
 		wd.taskMtx.Lock()
 		delete(wd.processingTasks, task.RunId)
+		delete(wd.activeTasks, task.RunId)
 		wd.taskMtx.Unlock()
 
 		go func() { wd.tryNextAsync() }()
+
+		close(task.done)
 	}()
 
 	// 查询运行实体，并级联更新状态
@@ -236,6 +357,16 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
 	workflow, err = wd.workflowRepo.GetById(task.ctx, workflowRun.WorkflowId)
 	if err != nil {
 		wd.syslog.Error(fmt.Sprintf("failed to get workflow #%s record", workflowRun.WorkflowId), slog.Any("error", err))
+		return
+	}
+
+	// 关闭边界：工作流已进入删除流程时，旧代际不得继续执行，直接落库为取消
+	if workflow.IsClosing() {
+		workflowRun.Status = domain.WorkflowRunStatusTypeCanceled
+		workflowRun.EndedAt = time.Now()
+		if _, err := wd.workflowRunRepo.SaveWithCascading(context.Background(), workflowRun); err != nil {
+			wd.syslog.Error(fmt.Sprintf("failed to cancel workrun #%s of closing workflow #%s", task.RunId, workflow.Id), slog.Any("error", err))
+		}
 		return
 	}
 
@@ -325,12 +456,33 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
 }
 
 func (wd *workflowDispatcher) tryNextAsync() {
-	wd.taskMtx.RLock()
+	wd.taskMtx.Lock()
+	defer wd.taskMtx.Unlock()
 
-	for _, pendingRunId := range wd.pendingRunQueue {
-		workflowRun, err := wd.workflowRunRepo.GetById(context.Background(), pendingRunId)
+	if !wd.booted {
+		return
+	}
+
+	// Iterate over a snapshot because queued entries may be withdrawn while we
+	// make repository calls (e.g. by a concurrent workflow shutdown).
+	for _, pendingTask := range slices.Clone(wd.pendingRunQueue) {
+		workflowRun, err := wd.workflowRunRepo.GetById(context.Background(), pendingTask.RunId)
 		if err != nil {
-			wd.syslog.Error(fmt.Sprintf("failed to get workrun #%s record", pendingRunId), slog.Any("error", err))
+			wd.syslog.Error(fmt.Sprintf("failed to get workrun #%s record", pendingTask.RunId), slog.Any("error", err))
+			continue
+		}
+
+		// 关闭边界：工作流已进入删除流程时，撤出该工作流的排队代际，
+		// 其数据库状态由 ShutdownWorkflow 的取消扫描负责纠正
+		if _, closing := wd.closingWorkflows[workflowRun.WorkflowId]; closing {
+			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is withdrawn, because the workflow is closing", workflowRun.WorkflowId, workflowRun.Id))
+			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.WorkflowId != workflowRun.WorkflowId })
+			continue
+		}
+
+		// 排队记录已不是 pending（例如已被取消），丢弃陈旧的队列项
+		if workflowRun.Status != domain.WorkflowRunStatusTypePending {
+			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.RunId != pendingTask.RunId })
 			continue
 		}
 
@@ -344,33 +496,45 @@ func (wd *workflowDispatcher) tryNextAsync() {
 
 		if hasSameWorkflowTask {
 			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is pending, because tasks that belonging to the same workflow already exists", workflowRun.WorkflowId, workflowRun.Id))
-		} else if len(wd.processingTasks) >= wd.concurrency && wd.concurrency > 0 {
-			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is pending, because the maximum concurrency (limit: %d) has been reached", workflowRun.WorkflowId, workflowRun.Id, wd.concurrency))
-		} else {
-			wd.taskMtx.RUnlock()
-
-			wd.taskMtx.Lock()
-			ctxRun, ctxCancel := context.WithCancel(context.Background())
-			task := &taskInfo{WorkflowId: workflowRun.WorkflowId, RunId: workflowRun.Id, ctx: ctxRun, cancel: ctxCancel}
-			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(s string, _ int) bool { return s != pendingRunId })
-			wd.processingTasks[pendingRunId] = task
-			wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s is being dispatched ...", task.WorkflowId, task.RunId))
-			wd.taskMtx.Unlock()
-
-			go func() { wd.tryExecuteAsync(task) }()
-			return
+			continue
 		}
-	}
 
-	wd.taskMtx.RUnlock()
+		if len(wd.processingTasks) >= wd.concurrency && wd.concurrency > 0 {
+			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is pending, because the maximum concurrency (limit: %d) has been reached", workflowRun.WorkflowId, workflowRun.Id, wd.concurrency))
+			continue
+		}
+
+		// 二次确认队列项仍在，避免与撤出/取消竞争
+		if !lo.ContainsBy(wd.pendingRunQueue, func(t *taskInfo) bool { return t.RunId == pendingTask.RunId }) {
+			continue
+		}
+
+		ctxRun, ctxCancel := context.WithCancel(context.Background())
+		task := &taskInfo{
+			WorkflowId: workflowRun.WorkflowId,
+			RunId:      workflowRun.Id,
+			ctx:        ctxRun,
+			cancel:     ctxCancel,
+			done:       make(chan struct{}),
+		}
+		wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.RunId != pendingTask.RunId })
+		wd.processingTasks[pendingTask.RunId] = task
+		wd.activeTasks[pendingTask.RunId] = task
+		wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s is being dispatched ...", task.WorkflowId, task.RunId))
+
+		go func() { wd.tryExecuteAsync(task) }()
+		return
+	}
 }
 
 func newWorkflowDispatcher() WorkflowDispatcher {
 	return &workflowDispatcher{
 		concurrency: envMaxWorkers,
 
-		pendingRunQueue: make([]string, 0),
-		processingTasks: make(map[string]*taskInfo),
+		pendingRunQueue:  make([]*taskInfo, 0),
+		processingTasks:  make(map[string]*taskInfo),
+		activeTasks:      make(map[string]*taskInfo),
+		closingWorkflows: make(map[string]struct{}),
 
 		workflowRepo:    repository.NewWorkflowRepository(),
 		workflowRunRepo: repository.NewWorkflowRunRepository(),

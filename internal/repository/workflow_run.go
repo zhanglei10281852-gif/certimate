@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/certimate-go/certimate/internal/app"
 	"github.com/certimate-go/certimate/internal/domain"
@@ -157,10 +158,78 @@ func (r *WorkflowRunRepository) DeleteWithExprs(ctx context.Context, exprs ...db
 	return ret, nil
 }
 
+// ListByWorkflowId returns all runs of the given workflow, newest first.
+func (r *WorkflowRunRepository) ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error) {
+	records, err := app.GetApp().FindRecordsByFilter(
+		domain.CollectionNameWorkflowRun,
+		"workflowRef={:workflowId}",
+		"-created",
+		0, 0,
+		dbx.Params{"workflowId": workflowId},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	workflowRuns := make([]*domain.WorkflowRun, 0, len(records))
+	for _, record := range records {
+		workflowRun, err := r.castRecordToModel(record)
+		if err != nil {
+			return nil, err
+		}
+
+		workflowRuns = append(workflowRuns, workflowRun)
+	}
+
+	return workflowRuns, nil
+}
+
+// CancelActiveByWorkflowId marks every still pending/processing run of the
+// workflow as canceled. It returns the affected run models so callers can
+// produce diagnostic messages and wait on the exact generations that were
+// active. This is part of the workflow ownership shutdown: it is the
+// database-side fence that stops queued generations from being dispatched
+// after an in-memory queue entry slipped past the close gate.
+func (r *WorkflowRunRepository) CancelActiveByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error) {
+	records, err := app.GetApp().FindRecordsByFilter(
+		domain.CollectionNameWorkflowRun,
+		"workflowRef={:workflowId} && (status={:pending} || status={:processing})",
+		"-created",
+		0, 0,
+		dbx.Params{
+			"workflowId": workflowId,
+			"pending":    domain.WorkflowRunStatusTypePending.String(),
+			"processing": domain.WorkflowRunStatusTypeProcessing.String(),
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	workflowRuns := make([]*domain.WorkflowRun, 0, len(records))
+	for _, record := range records {
+		record.IgnoreUnchangedFields(true)
+		record.Set("status", domain.WorkflowRunStatusTypeCanceled.String())
+		record.Set("endedAt", time.Now())
+		if err := app.GetApp().Save(record); err != nil {
+			return nil, err
+		}
+
+		workflowRun, err := r.castRecordToModel(record)
+		if err != nil {
+			return nil, err
+		}
+		workflowRuns = append(workflowRuns, workflowRun)
+	}
+
+	return workflowRuns, nil
+}
+
 func (r *WorkflowRunRepository) ResetStatusIfHanging(ctx context.Context) error {
 	return app.GetApp().RunInTransaction(func(txApp core.App) error {
 		var err error
 
+		// 重置工作流上最后一次运行的悬挂状态
 		_, err = txApp.DB().
 			NewQuery(fmt.Sprintf("UPDATE %s SET lastRunStatus = '%s' WHERE lastRunStatus = '%s' OR lastRunStatus = '%s'",
 				domain.CollectionNameWorkflow,
@@ -173,9 +242,10 @@ func (r *WorkflowRunRepository) ResetStatusIfHanging(ctx context.Context) error 
 			return err
 		}
 
+		// 重置运行记录的悬挂状态，避免进程异常退出后旧代际永远停留在排队/执行中
 		_, err = txApp.DB().
-			NewQuery(fmt.Sprintf("UPDATE %s SET lastRunStatus = '%s' WHERE lastRunStatus = '%s' OR lastRunStatus = '%s'",
-				domain.CollectionNameWorkflow,
+			NewQuery(fmt.Sprintf("UPDATE %s SET status = '%s', endedAt = CURRENT_TIMESTAMP WHERE status = '%s' OR status = '%s'",
+				domain.CollectionNameWorkflowRun,
 				domain.WorkflowRunStatusTypeCanceled.String(),
 				domain.WorkflowRunStatusTypePending.String(),
 				domain.WorkflowRunStatusTypeProcessing.String(),

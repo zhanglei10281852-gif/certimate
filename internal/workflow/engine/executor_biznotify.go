@@ -65,6 +65,11 @@ func (ne *bizNotifyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
 	subject := reMustache.ReplaceAllStringFunc(nodeCfg.Subject, reMustacheReplacer)
 	message := reMustache.ReplaceAllStringFunc(nodeCfg.Message, reMustacheReplacer)
 
+	// 关闭边界：取消边界之后不得再发送通知这类外部效果
+	if err := execCtx.Context().Err(); err != nil {
+		return execRes, err
+	}
+
 	// 推送通知
 	notifier := notify.NewClient(notify.WithLogger(ne.logger))
 	notifyReq := &notify.SendNotificationRequest{

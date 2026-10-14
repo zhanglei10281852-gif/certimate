@@ -74,6 +74,34 @@ func (r *CertificateRepository) GetByWorkflowRunIdAndNodeId(ctx context.Context,
 	return r.castRecordToModel(records[0])
 }
 
+// ListByWorkflowId returns all non-deleted certificates that still reference
+// the given workflow, newest first. It is used while shutting down a workflow
+// to backfill provenance snapshots before the relation gets nulled out.
+func (r *CertificateRepository) ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.Certificate, error) {
+	records, err := app.GetApp().FindRecordsByFilter(
+		domain.CollectionNameCertificate,
+		"workflowRef={:workflowId} && deleted=null",
+		"-created",
+		0, 0,
+		dbx.Params{"workflowId": workflowId},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	certificates := make([]*domain.Certificate, 0, len(records))
+	for _, record := range records {
+		certificate, err := r.castRecordToModel(record)
+		if err != nil {
+			return nil, err
+		}
+
+		certificates = append(certificates, certificate)
+	}
+
+	return certificates, nil
+}
+
 func (r *CertificateRepository) Save(ctx context.Context, certificate *domain.Certificate) (*domain.Certificate, error) {
 	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameCertificate)
 	if err != nil {
@@ -115,6 +143,7 @@ func (r *CertificateRepository) Save(ctx context.Context, certificate *domain.Ce
 	record.Set("workflowRef", certificate.WorkflowId)
 	record.Set("workflowRunRef", certificate.WorkflowRunId)
 	record.Set("workflowNodeId", certificate.WorkflowNodeId)
+	record.Set("sourceSnapshot", certificate.SourceSnapshot)
 	if err := app.GetApp().Save(record); err != nil {
 		return certificate, err
 	}
@@ -153,6 +182,14 @@ func (r *CertificateRepository) castRecordToModel(record *core.Record) (*domain.
 		return nil, fmt.Errorf("the record is nil")
 	}
 
+	var sourceSnapshot *domain.CertificateSourceSnapshot
+	if rawSnapshot := record.Get("sourceSnapshot"); rawSnapshot != nil {
+		sourceSnapshot = &domain.CertificateSourceSnapshot{}
+		if err := record.UnmarshalJSONField("sourceSnapshot", sourceSnapshot); err != nil {
+			return nil, fmt.Errorf("field 'sourceSnapshot' is malformed")
+		}
+	}
+
 	certificate := &domain.Certificate{
 		Meta: domain.Meta{
 			Id:        record.Id,
@@ -181,6 +218,7 @@ func (r *CertificateRepository) castRecordToModel(record *core.Record) (*domain.
 		WorkflowId:         record.GetString("workflowRef"),
 		WorkflowRunId:      record.GetString("workflowRunRef"),
 		WorkflowNodeId:     record.GetString("workflowNodeId"),
+		SourceSnapshot:     sourceSnapshot,
 	}
 	return certificate, nil
 }

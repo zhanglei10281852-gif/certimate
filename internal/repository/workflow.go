@@ -21,10 +21,14 @@ func NewWorkflowRepository() *WorkflowRepository {
 func (r *WorkflowRepository) ListEnabledScheduled(ctx context.Context) ([]*domain.Workflow, error) {
 	records, err := app.GetApp().FindRecordsByFilter(
 		domain.CollectionNameWorkflow,
-		"enabled={:enabled} && trigger={:trigger}",
+		"enabled={:enabled} && trigger={:trigger} && lifecycle!={:lifecycle}",
 		"-created",
 		0, 0,
-		dbx.Params{"enabled": true, "trigger": domain.WorkflowTriggerTypeScheduled.String()},
+		dbx.Params{
+			"enabled":   true,
+			"trigger":   domain.WorkflowTriggerTypeScheduled.String(),
+			"lifecycle": domain.WorkflowLifecycleClosing.String(),
+		},
 	)
 	if err != nil {
 		return nil, err
@@ -86,6 +90,7 @@ func (r *WorkflowRepository) Save(ctx context.Context, workflow *domain.Workflow
 	record.Set("lastRunRef", workflow.LastRunId)
 	record.Set("lastRunStatus", workflow.LastRunStatus.String())
 	record.Set("lastRunTime", workflow.LastRunTime)
+	record.Set("lifecycle", workflow.Lifecycle.String())
 	if err := app.GetApp().Save(record); err != nil {
 		return workflow, err
 	}
@@ -129,6 +134,29 @@ func (r *WorkflowRepository) castRecordToModel(record *core.Record) (*domain.Wor
 		LastRunId:     record.GetString("lastRunRef"),
 		LastRunStatus: domain.WorkflowRunStatusType(record.GetString("lastRunStatus")),
 		LastRunTime:   record.GetDateTime("lastRunTime").Time(),
+		Lifecycle:     domain.WorkflowLifecycleType(record.GetString("lifecycle")),
 	}
 	return workflow, nil
+}
+
+// MarkClosing persists the deletion in-progress ownership fence on the
+// workflow. It is idempotent: workflows that are already closing are left
+// untouched so that a deletion can be retried safely after a failure.
+func (r *WorkflowRepository) MarkClosing(ctx context.Context, id string) error {
+	record, err := app.GetApp().FindRecordById(domain.CollectionNameWorkflow, id)
+	if err != nil {
+		return err
+	}
+
+	if record.GetString("lifecycle") == domain.WorkflowLifecycleClosing.String() {
+		return nil
+	}
+
+	record.IgnoreUnchangedFields(true)
+	record.Set("lifecycle", domain.WorkflowLifecycleClosing.String())
+	if err := app.GetApp().Save(record); err != nil {
+		return err
+	}
+
+	return nil
 }

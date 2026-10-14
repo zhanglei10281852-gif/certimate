@@ -25,7 +25,27 @@ type Workflow struct {
 	LastRunId     string                `db:"lastRunRef"    json:"lastRunId"`
 	LastRunStatus WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
 	LastRunTime   time.Time             `db:"lastRunTime"   json:"lastRunTime"`
+	Lifecycle     WorkflowLifecycleType `db:"lifecycle"     json:"lifecycle"`
 }
+
+// IsClosing reports whether the workflow's ownership is being shut down
+// (i.e. a deletion is in progress). A closing workflow rejects new
+// manual/scheduled runs and its in-flight runs are being drained.
+func (w *Workflow) IsClosing() bool {
+	return w.Lifecycle == WorkflowLifecycleClosing
+}
+
+type WorkflowLifecycleType string
+
+func (t WorkflowLifecycleType) String() string {
+	return string(t)
+}
+
+const (
+	// WorkflowLifecycleClosing marks the deletion in-progress fence. The zero
+	// value (empty string) represents the ordinary active lifecycle.
+	WorkflowLifecycleClosing WorkflowLifecycleType = "closing"
+)
 
 type WorkflowGraph struct {
 	Nodes []*WorkflowNode `json:"nodes"`

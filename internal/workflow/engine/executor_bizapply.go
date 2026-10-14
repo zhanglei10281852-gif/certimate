@@ -103,6 +103,11 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
 		return execRes, err
 	}
 
+	// 关闭边界：申请结果跨越取消边界返回时，不得再发布证书或产生后续外部效果
+	if err := execCtx.Context().Err(); err != nil {
+		return execRes, err
+	}
+
 	// 保存证书实体
 	certificate := &domain.Certificate{
 		Source:             domain.CertificateSourceTypeRequest,
@@ -115,6 +120,7 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
 		WorkflowId:         execCtx.WorkflowId,
 		WorkflowRunId:      execCtx.RunId,
 		WorkflowNodeId:     execCtx.Node.Id,
+		SourceSnapshot:     buildCertificateSourceSnapshot(execCtx),
 	}
 	certificate.PopulateFromPEM(obtainResp.FullChainCertificate, obtainResp.PrivateKey)
 	if certificate, err := ne.certificateRepo.Save(execCtx.Context(), certificate); err != nil {
@@ -126,6 +132,9 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
 
 	// 保存 ARI 替换状态
 	if lastCertificate != nil && obtainResp.ARIReplaced {
+		if err := execCtx.Context().Err(); err != nil {
+			return execRes, err
+		}
 		lastCertificate.IsRenewed = true
 		ne.certificateRepo.Save(execCtx.Context(), lastCertificate)
 	}

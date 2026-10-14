@@ -29,7 +29,7 @@ func BindRouter(router *router.Router[*core.RequestEvent]) {
 	statisticsRepo := repository.NewStatisticsRepository()
 
 	certificateSvc = certificate.NewCertificateService(acmeAccountRepo, certificateRepo)
-	workflowSvc = workflow.NewWorkflowService(workflowRepo, workflowRunRepo)
+	workflowSvc = workflow.NewWorkflowService(workflowRepo, workflowRunRepo, certificateRepo)
 	statisticsSvc = statistics.NewStatisticsService(statisticsRepo)
 	notifySvc = notify.NewNotifyService(accessRepo)
 

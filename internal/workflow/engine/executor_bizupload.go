@@ -173,12 +173,18 @@ func (ne *bizUploadNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
 		}
 	}
 
+	// 关闭边界：结果跨越取消边界返回时，不得再发布证书或产生后续外部效果
+	if err := execCtx.Context().Err(); err != nil {
+		return execRes, err
+	}
+
 	// 保存证书实体
 	certificate := &domain.Certificate{
 		Source:         domain.CertificateSourceTypeUpload,
 		WorkflowId:     execCtx.WorkflowId,
 		WorkflowRunId:  execCtx.RunId,
 		WorkflowNodeId: execCtx.Node.Id,
+		SourceSnapshot: buildCertificateSourceSnapshot(execCtx),
 	}
 	certificate.PopulateFromPEM(certPEM, privkeyPEM)
 	if certificate, err := ne.certificateRepo.Save(execCtx.Context(), certificate); err != nil {

@@ -88,6 +88,11 @@ func (ne *bizDeployNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
 		}
 	}
 
+	// 关闭边界：取消边界之后不得再执行部署这类外部效果
+	if err := execCtx.Context().Err(); err != nil {
+		return execRes, err
+	}
+
 	// 部署证书
 	deployer := certmgmt.NewClient(certmgmt.WithLogger(ne.logger))
 	deployReq := &certmgmt.DeployCertificateRequest{

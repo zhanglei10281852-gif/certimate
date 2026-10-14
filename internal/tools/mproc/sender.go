@@ -151,9 +151,29 @@ func (s *sender[TIn, TOut]) SendWithContext(ctx context.Context, params *TIn) (*
 		}
 	}()
 
-	// 等待子进程退出
-	<-mcmd.Start()
-	<-done
+	// 等待子进程启动；若上下文在此之前已取消，则直接放弃启动
+	select {
+	case startStatus := <-mcmd.Start():
+		if startStatus.Error != nil {
+			return nil, fmt.Errorf("mproc: failed to start child process: %w", startStatus.Error)
+		}
+	case <-ctx.Done():
+		_ = mcmd.Stop()
+		return nil, fmt.Errorf("mproc: canceled before child process started: %w", ctx.Err())
+	}
+
+	// 等待子进程退出；上下文取消时终止子进程（Unix 下为整个进程组），
+	// 确保旧代际在关闭边界之后不会继续申请证书等外部操作
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if stopErr := mcmd.Stop(); stopErr != nil && s.logger != nil {
+			s.logger.Warn(fmt.Sprintf("mproc: failed to stop child process after cancellation: %v", stopErr))
+		}
+		<-done
+		return nil, fmt.Errorf("mproc: child process was stopped due to cancellation: %w", ctx.Err())
+	}
+
 	if err := mcmd.Status().Error; err != nil {
 		return nil, fmt.Errorf("mproc: failed to exec child process: %w", err)
 	}

@@ -182,6 +182,12 @@ func (we *workflowEngine) executeNode(wfCtx *WorkflowContext, node *Node) error 
 
 	we.fireOnNodeEndHooks(wfCtx.ctx, node, execRes)
 
+	// 关闭边界：节点执行期间运行被取消（如工作流正在删除）时，迟到的节点
+	// 结果不得再发布输出，直接返回让旧代际停止
+	if err := wfCtx.ctx.Err(); err != nil {
+		return err
+	}
+
 	if execRes != nil {
 		if execRes.Variables != nil {
 			for _, variable := range execRes.Variables {

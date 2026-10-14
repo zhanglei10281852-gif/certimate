@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+
+	"github.com/certimate-go/certimate/internal/domain"
 )
 
 type NodeExecutor interface {
@@ -18,6 +20,26 @@ type nodeExecutor struct {
 
 func (e *nodeExecutor) SetLogger(logger *slog.Logger) {
 	e.logger = logger
+}
+
+// buildCertificateSourceSnapshot captures the provenance of a certificate
+// produced by the current node. The snapshot is persisted together with the
+// certificate so that it remains explainable after its owning workflow/run
+// relation fields have been nulled upon workflow deletion.
+func buildCertificateSourceSnapshot(execCtx *NodeExecutionContext) *domain.CertificateSourceSnapshot {
+	snapshot := &domain.CertificateSourceSnapshot{
+		WorkflowId: execCtx.WorkflowId,
+		RunId:      execCtx.RunId,
+		NodeId:     execCtx.Node.Id,
+		NodeName:   execCtx.Node.Data.Name,
+	}
+	if state, ok := execCtx.variables.Get(stateVarKeyWorkflowName); ok {
+		snapshot.WorkflowName = state.ValueString()
+	}
+	if state, ok := execCtx.variables.Get(stateVarKeyRunTrigger); ok {
+		snapshot.RunTrigger = state.ValueString()
+	}
+	return snapshot
 }
 
 type NodeExecutionContext struct {

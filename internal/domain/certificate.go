@@ -39,7 +39,23 @@ type Certificate struct {
 	WorkflowId         string                          `db:"workflowRef"       json:"workflowId"`
 	WorkflowRunId      string                          `db:"workflowRunRef"    json:"workflowRunId"`
 	WorkflowNodeId     string                          `db:"workflowNodeId"    json:"workflowNodeId"`
+	SourceSnapshot     *CertificateSourceSnapshot      `db:"sourceSnapshot"    json:"sourceSnapshot"`
 	DeletedAt          *time.Time                      `db:"deleted" json:"deleted"`
+}
+
+// CertificateSourceSnapshot is a denormalized provenance snapshot captured
+// while the certificate is produced by a workflow run. The workflow/run
+// relation fields are configured with cascadeDelete=false, so deleting the
+// owning workflow nulls them out; the snapshot keeps enough origin
+// information for the retained certificate to remain explainable and
+// downloadable afterwards.
+type CertificateSourceSnapshot struct {
+	WorkflowId   string `json:"workflowId"`
+	WorkflowName string `json:"workflowName"`
+	RunId        string `json:"runId"`
+	RunTrigger   string `json:"runTrigger"`
+	NodeId       string `json:"nodeId"`
+	NodeName     string `json:"nodeName"`
 }
 
 func (c *Certificate) PopulateFromX509(certX509 *x509.Certificate) *Certificate {

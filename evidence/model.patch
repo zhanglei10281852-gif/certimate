@@ -1,0 +1,1280 @@
+diff --git a/internal/domain/certificate.go b/internal/domain/certificate.go
+index b2d44491..ae5ca494 100644
+--- a/internal/domain/certificate.go
++++ b/internal/domain/certificate.go
+@@ -39,9 +39,25 @@ type Certificate struct {
+ 	WorkflowId         string                          `db:"workflowRef"       json:"workflowId"`
+ 	WorkflowRunId      string                          `db:"workflowRunRef"    json:"workflowRunId"`
+ 	WorkflowNodeId     string                          `db:"workflowNodeId"    json:"workflowNodeId"`
++	SourceSnapshot     *CertificateSourceSnapshot      `db:"sourceSnapshot"    json:"sourceSnapshot"`
+ 	DeletedAt          *time.Time                      `db:"deleted" json:"deleted"`
+ }
+ 
++// CertificateSourceSnapshot is a denormalized provenance snapshot captured
++// while the certificate is produced by a workflow run. The workflow/run
++// relation fields are configured with cascadeDelete=false, so deleting the
++// owning workflow nulls them out; the snapshot keeps enough origin
++// information for the retained certificate to remain explainable and
++// downloadable afterwards.
++type CertificateSourceSnapshot struct {
++	WorkflowId   string `json:"workflowId"`
++	WorkflowName string `json:"workflowName"`
++	RunId        string `json:"runId"`
++	RunTrigger   string `json:"runTrigger"`
++	NodeId       string `json:"nodeId"`
++	NodeName     string `json:"nodeName"`
++}
++
+ func (c *Certificate) PopulateFromX509(certX509 *x509.Certificate) *Certificate {
+ 	c.SerialNumber = strings.ToUpper(certX509.SerialNumber.Text(16))
+ 	c.SubjectName = certX509.Subject.CommonName
+diff --git a/internal/domain/workflow.go b/internal/domain/workflow.go
+index c5e6f7b7..e7ec479b 100644
+--- a/internal/domain/workflow.go
++++ b/internal/domain/workflow.go
+@@ -25,8 +25,28 @@ type Workflow struct {
+ 	LastRunId     string                `db:"lastRunRef"    json:"lastRunId"`
+ 	LastRunStatus WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
+ 	LastRunTime   time.Time             `db:"lastRunTime"   json:"lastRunTime"`
++	Lifecycle     WorkflowLifecycleType `db:"lifecycle"     json:"lifecycle"`
+ }
+ 
++// IsClosing reports whether the workflow's ownership is being shut down
++// (i.e. a deletion is in progress). A closing workflow rejects new
++// manual/scheduled runs and its in-flight runs are being drained.
++func (w *Workflow) IsClosing() bool {
++	return w.Lifecycle == WorkflowLifecycleClosing
++}
++
++type WorkflowLifecycleType string
++
++func (t WorkflowLifecycleType) String() string {
++	return string(t)
++}
++
++const (
++	// WorkflowLifecycleClosing marks the deletion in-progress fence. The zero
++	// value (empty string) represents the ordinary active lifecycle.
++	WorkflowLifecycleClosing WorkflowLifecycleType = "closing"
++)
++
+ type WorkflowGraph struct {
+ 	Nodes []*WorkflowNode `json:"nodes"`
+ }
+diff --git a/internal/repository/certificate.go b/internal/repository/certificate.go
+index f09b8f63..e084e86d 100644
+--- a/internal/repository/certificate.go
++++ b/internal/repository/certificate.go
+@@ -74,6 +74,34 @@ func (r *CertificateRepository) GetByWorkflowRunIdAndNodeId(ctx context.Context,
+ 	return r.castRecordToModel(records[0])
+ }
+ 
++// ListByWorkflowId returns all non-deleted certificates that still reference
++// the given workflow, newest first. It is used while shutting down a workflow
++// to backfill provenance snapshots before the relation gets nulled out.
++func (r *CertificateRepository) ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.Certificate, error) {
++	records, err := app.GetApp().FindRecordsByFilter(
++		domain.CollectionNameCertificate,
++		"workflowRef={:workflowId} && deleted=null",
++		"-created",
++		0, 0,
++		dbx.Params{"workflowId": workflowId},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	certificates := make([]*domain.Certificate, 0, len(records))
++	for _, record := range records {
++		certificate, err := r.castRecordToModel(record)
++		if err != nil {
++			return nil, err
++		}
++
++		certificates = append(certificates, certificate)
++	}
++
++	return certificates, nil
++}
++
+ func (r *CertificateRepository) Save(ctx context.Context, certificate *domain.Certificate) (*domain.Certificate, error) {
+ 	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameCertificate)
+ 	if err != nil {
+@@ -115,6 +143,7 @@ func (r *CertificateRepository) Save(ctx context.Context, certificate *domain.Ce
+ 	record.Set("workflowRef", certificate.WorkflowId)
+ 	record.Set("workflowRunRef", certificate.WorkflowRunId)
+ 	record.Set("workflowNodeId", certificate.WorkflowNodeId)
++	record.Set("sourceSnapshot", certificate.SourceSnapshot)
+ 	if err := app.GetApp().Save(record); err != nil {
+ 		return certificate, err
+ 	}
+@@ -153,6 +182,14 @@ func (r *CertificateRepository) castRecordToModel(record *core.Record) (*domain.
+ 		return nil, fmt.Errorf("the record is nil")
+ 	}
+ 
++	var sourceSnapshot *domain.CertificateSourceSnapshot
++	if rawSnapshot := record.Get("sourceSnapshot"); rawSnapshot != nil {
++		sourceSnapshot = &domain.CertificateSourceSnapshot{}
++		if err := record.UnmarshalJSONField("sourceSnapshot", sourceSnapshot); err != nil {
++			return nil, fmt.Errorf("field 'sourceSnapshot' is malformed")
++		}
++	}
++
+ 	certificate := &domain.Certificate{
+ 		Meta: domain.Meta{
+ 			Id:        record.Id,
+@@ -181,6 +218,7 @@ func (r *CertificateRepository) castRecordToModel(record *core.Record) (*domain.
+ 		WorkflowId:         record.GetString("workflowRef"),
+ 		WorkflowRunId:      record.GetString("workflowRunRef"),
+ 		WorkflowNodeId:     record.GetString("workflowNodeId"),
++		SourceSnapshot:     sourceSnapshot,
+ 	}
+ 	return certificate, nil
+ }
+diff --git a/internal/repository/workflow.go b/internal/repository/workflow.go
+index 45458cda..fc832fa2 100644
+--- a/internal/repository/workflow.go
++++ b/internal/repository/workflow.go
+@@ -21,10 +21,14 @@ func NewWorkflowRepository() *WorkflowRepository {
+ func (r *WorkflowRepository) ListEnabledScheduled(ctx context.Context) ([]*domain.Workflow, error) {
+ 	records, err := app.GetApp().FindRecordsByFilter(
+ 		domain.CollectionNameWorkflow,
+-		"enabled={:enabled} && trigger={:trigger}",
++		"enabled={:enabled} && trigger={:trigger} && lifecycle!={:lifecycle}",
+ 		"-created",
+ 		0, 0,
+-		dbx.Params{"enabled": true, "trigger": domain.WorkflowTriggerTypeScheduled.String()},
++		dbx.Params{
++			"enabled":   true,
++			"trigger":   domain.WorkflowTriggerTypeScheduled.String(),
++			"lifecycle": domain.WorkflowLifecycleClosing.String(),
++		},
+ 	)
+ 	if err != nil {
+ 		return nil, err
+@@ -86,6 +90,7 @@ func (r *WorkflowRepository) Save(ctx context.Context, workflow *domain.Workflow
+ 	record.Set("lastRunRef", workflow.LastRunId)
+ 	record.Set("lastRunStatus", workflow.LastRunStatus.String())
+ 	record.Set("lastRunTime", workflow.LastRunTime)
++	record.Set("lifecycle", workflow.Lifecycle.String())
+ 	if err := app.GetApp().Save(record); err != nil {
+ 		return workflow, err
+ 	}
+@@ -129,6 +134,29 @@ func (r *WorkflowRepository) castRecordToModel(record *core.Record) (*domain.Wor
+ 		LastRunId:     record.GetString("lastRunRef"),
+ 		LastRunStatus: domain.WorkflowRunStatusType(record.GetString("lastRunStatus")),
+ 		LastRunTime:   record.GetDateTime("lastRunTime").Time(),
++		Lifecycle:     domain.WorkflowLifecycleType(record.GetString("lifecycle")),
+ 	}
+ 	return workflow, nil
+ }
++
++// MarkClosing persists the deletion in-progress ownership fence on the
++// workflow. It is idempotent: workflows that are already closing are left
++// untouched so that a deletion can be retried safely after a failure.
++func (r *WorkflowRepository) MarkClosing(ctx context.Context, id string) error {
++	record, err := app.GetApp().FindRecordById(domain.CollectionNameWorkflow, id)
++	if err != nil {
++		return err
++	}
++
++	if record.GetString("lifecycle") == domain.WorkflowLifecycleClosing.String() {
++		return nil
++	}
++
++	record.IgnoreUnchangedFields(true)
++	record.Set("lifecycle", domain.WorkflowLifecycleClosing.String())
++	if err := app.GetApp().Save(record); err != nil {
++		return err
++	}
++
++	return nil
++}
+diff --git a/internal/repository/workflow_run.go b/internal/repository/workflow_run.go
+index 5dab7a8b..9a0725ca 100644
+--- a/internal/repository/workflow_run.go
++++ b/internal/repository/workflow_run.go
+@@ -5,6 +5,7 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
++	"time"
+ 
+ 	"github.com/certimate-go/certimate/internal/app"
+ 	"github.com/certimate-go/certimate/internal/domain"
+@@ -157,10 +158,78 @@ func (r *WorkflowRunRepository) DeleteWithExprs(ctx context.Context, exprs ...db
+ 	return ret, nil
+ }
+ 
++// ListByWorkflowId returns all runs of the given workflow, newest first.
++func (r *WorkflowRunRepository) ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error) {
++	records, err := app.GetApp().FindRecordsByFilter(
++		domain.CollectionNameWorkflowRun,
++		"workflowRef={:workflowId}",
++		"-created",
++		0, 0,
++		dbx.Params{"workflowId": workflowId},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	workflowRuns := make([]*domain.WorkflowRun, 0, len(records))
++	for _, record := range records {
++		workflowRun, err := r.castRecordToModel(record)
++		if err != nil {
++			return nil, err
++		}
++
++		workflowRuns = append(workflowRuns, workflowRun)
++	}
++
++	return workflowRuns, nil
++}
++
++// CancelActiveByWorkflowId marks every still pending/processing run of the
++// workflow as canceled. It returns the affected run models so callers can
++// produce diagnostic messages and wait on the exact generations that were
++// active. This is part of the workflow ownership shutdown: it is the
++// database-side fence that stops queued generations from being dispatched
++// after an in-memory queue entry slipped past the close gate.
++func (r *WorkflowRunRepository) CancelActiveByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error) {
++	records, err := app.GetApp().FindRecordsByFilter(
++		domain.CollectionNameWorkflowRun,
++		"workflowRef={:workflowId} && (status={:pending} || status={:processing})",
++		"-created",
++		0, 0,
++		dbx.Params{
++			"workflowId": workflowId,
++			"pending":    domain.WorkflowRunStatusTypePending.String(),
++			"processing": domain.WorkflowRunStatusTypeProcessing.String(),
++		},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	workflowRuns := make([]*domain.WorkflowRun, 0, len(records))
++	for _, record := range records {
++		record.IgnoreUnchangedFields(true)
++		record.Set("status", domain.WorkflowRunStatusTypeCanceled.String())
++		record.Set("endedAt", time.Now())
++		if err := app.GetApp().Save(record); err != nil {
++			return nil, err
++		}
++
++		workflowRun, err := r.castRecordToModel(record)
++		if err != nil {
++			return nil, err
++		}
++		workflowRuns = append(workflowRuns, workflowRun)
++	}
++
++	return workflowRuns, nil
++}
++
+ func (r *WorkflowRunRepository) ResetStatusIfHanging(ctx context.Context) error {
+ 	return app.GetApp().RunInTransaction(func(txApp core.App) error {
+ 		var err error
+ 
++		// 重置工作流上最后一次运行的悬挂状态
+ 		_, err = txApp.DB().
+ 			NewQuery(fmt.Sprintf("UPDATE %s SET lastRunStatus = '%s' WHERE lastRunStatus = '%s' OR lastRunStatus = '%s'",
+ 				domain.CollectionNameWorkflow,
+@@ -173,9 +242,10 @@ func (r *WorkflowRunRepository) ResetStatusIfHanging(ctx context.Context) error
+ 			return err
+ 		}
+ 
++		// 重置运行记录的悬挂状态，避免进程异常退出后旧代际永远停留在排队/执行中
+ 		_, err = txApp.DB().
+-			NewQuery(fmt.Sprintf("UPDATE %s SET lastRunStatus = '%s' WHERE lastRunStatus = '%s' OR lastRunStatus = '%s'",
+-				domain.CollectionNameWorkflow,
++			NewQuery(fmt.Sprintf("UPDATE %s SET status = '%s', endedAt = CURRENT_TIMESTAMP WHERE status = '%s' OR status = '%s'",
++				domain.CollectionNameWorkflowRun,
+ 				domain.WorkflowRunStatusTypeCanceled.String(),
+ 				domain.WorkflowRunStatusTypePending.String(),
+ 				domain.WorkflowRunStatusTypeProcessing.String(),
+diff --git a/internal/rest/routes/routes.go b/internal/rest/routes/routes.go
+index 16516060..600c8cdb 100644
+--- a/internal/rest/routes/routes.go
++++ b/internal/rest/routes/routes.go
+@@ -29,7 +29,7 @@ func BindRouter(router *router.Router[*core.RequestEvent]) {
+ 	statisticsRepo := repository.NewStatisticsRepository()
+ 
+ 	certificateSvc = certificate.NewCertificateService(acmeAccountRepo, certificateRepo)
+-	workflowSvc = workflow.NewWorkflowService(workflowRepo, workflowRunRepo)
++	workflowSvc = workflow.NewWorkflowService(workflowRepo, workflowRunRepo, certificateRepo)
+ 	statisticsSvc = statistics.NewStatisticsService(statisticsRepo)
+ 	notifySvc = notify.NewNotifyService(accessRepo)
+ 
+diff --git a/internal/scheduler/scheduler.go b/internal/scheduler/scheduler.go
+index 9febd96e..026c8293 100644
+--- a/internal/scheduler/scheduler.go
++++ b/internal/scheduler/scheduler.go
+@@ -15,7 +15,7 @@ func Setup() {
+ 	acmeAccountRepo := repository.NewACMEAccountRepository()
+ 	certificateRepo := repository.NewCertificateRepository()
+ 
+-	workflowSvc := workflow.NewWorkflowService(workflowRepo, workflowRunRepo)
++	workflowSvc := workflow.NewWorkflowService(workflowRepo, workflowRunRepo, certificateRepo)
+ 	certificateSvc := certificate.NewCertificateService(acmeAccountRepo, certificateRepo)
+ 
+ 	if err := initWorkflowScheduler(workflowSvc); err != nil {
+diff --git a/internal/tools/mproc/sender.go b/internal/tools/mproc/sender.go
+index e0cdf1e3..8f839e5d 100644
+--- a/internal/tools/mproc/sender.go
++++ b/internal/tools/mproc/sender.go
+@@ -151,9 +151,29 @@ func (s *sender[TIn, TOut]) SendWithContext(ctx context.Context, params *TIn) (*
+ 		}
+ 	}()
+ 
+-	// 等待子进程退出
+-	<-mcmd.Start()
+-	<-done
++	// 等待子进程启动；若上下文在此之前已取消，则直接放弃启动
++	select {
++	case startStatus := <-mcmd.Start():
++		if startStatus.Error != nil {
++			return nil, fmt.Errorf("mproc: failed to start child process: %w", startStatus.Error)
++		}
++	case <-ctx.Done():
++		_ = mcmd.Stop()
++		return nil, fmt.Errorf("mproc: canceled before child process started: %w", ctx.Err())
++	}
++
++	// 等待子进程退出；上下文取消时终止子进程（Unix 下为整个进程组），
++	// 确保旧代际在关闭边界之后不会继续申请证书等外部操作
++	select {
++	case <-done:
++	case <-ctx.Done():
++		if stopErr := mcmd.Stop(); stopErr != nil && s.logger != nil {
++			s.logger.Warn(fmt.Sprintf("mproc: failed to stop child process after cancellation: %v", stopErr))
++		}
++		<-done
++		return nil, fmt.Errorf("mproc: child process was stopped due to cancellation: %w", ctx.Err())
++	}
++
+ 	if err := mcmd.Status().Error; err != nil {
+ 		return nil, fmt.Errorf("mproc: failed to exec child process: %w", err)
+ 	}
+diff --git a/internal/workflow/dispatcher/deps.go b/internal/workflow/dispatcher/deps.go
+index 3bad2060..eaad3d58 100644
+--- a/internal/workflow/dispatcher/deps.go
++++ b/internal/workflow/dispatcher/deps.go
+@@ -15,6 +15,7 @@ type workflowRunRepository interface {
+ 	GetById(ctx context.Context, id string) (*domain.WorkflowRun, error)
+ 	Save(ctx context.Context, workflowRun *domain.WorkflowRun) (*domain.WorkflowRun, error)
+ 	SaveWithCascading(ctx context.Context, workflowRun *domain.WorkflowRun) (*domain.WorkflowRun, error)
++	CancelActiveByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error)
+ 	ResetStatusIfHanging(ctx context.Context) error
+ }
+ 
+diff --git a/internal/workflow/dispatcher/dispatcher.go b/internal/workflow/dispatcher/dispatcher.go
+index eaa5ab16..175fa06b 100644
+--- a/internal/workflow/dispatcher/dispatcher.go
++++ b/internal/workflow/dispatcher/dispatcher.go
+@@ -8,6 +8,8 @@ import (
+ 	"log/slog"
+ 	"runtime"
+ 	"runtime/debug"
++	"slices"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -22,12 +24,18 @@ import (
+ )
+ 
+ var envMaxWorkers = 1
++var envShutdownTimeoutSeconds = 30
+ 
+ func init() {
+ 	envMaxWorkers = xenv.GetOrDefaultInt("CERTIMATE_WORKFLOW_MAX_WORKERS", runtime.GOMAXPROCS(0))
+ 	if envMaxWorkers <= 0 {
+ 		envMaxWorkers = max(1, runtime.NumCPU())
+ 	}
++
++	envShutdownTimeoutSeconds = xenv.GetOrDefaultInt("CERTIMATE_WORKFLOW_SHUTDOWN_TIMEOUT_SECONDS", envShutdownTimeoutSeconds)
++	if envShutdownTimeoutSeconds <= 0 {
++		envShutdownTimeoutSeconds = 30
++	}
+ }
+ 
+ type WorkflowDispatcher interface {
+@@ -35,8 +43,17 @@ type WorkflowDispatcher interface {
+ 
+ 	Bootup(ctx context.Context) error
+ 	Shutdown(ctx context.Context) error
+-	Start(ctx context.Context, runId string) error
++	Start(ctx context.Context, workflowId string, runId string) error
+ 	Cancel(ctx context.Context, runId string) error
++
++	// ShutdownWorkflow closes the ownership of a single workflow: it rejects
++	// new runs, withdraws queued runs, cancels in-flight executions (and their
++	// child processes) and waits until all of its execution goroutines have
++	// converged. It is idempotent and safe to retry.
++	ShutdownWorkflow(ctx context.Context, workflowId string) error
++	// ReleaseWorkflow clears the in-memory close fence after the workflow
++	// record has been committed to deletion.
++	ReleaseWorkflow(workflowId string)
+ }
+ 
+ type Statistics struct {
+@@ -49,9 +66,11 @@ type workflowDispatcher struct {
+ 	booted      bool
+ 	concurrency int
+ 
+-	taskMtx         sync.RWMutex
+-	pendingRunQueue []string
+-	processingTasks map[string]*taskInfo // Key: RunId
++	taskMtx          sync.RWMutex
++	pendingRunQueue  []*taskInfo
++	processingTasks  map[string]*taskInfo // Key: RunId, removed as soon as a slot is freed
++	activeTasks      map[string]*taskInfo // Key: RunId, removed only once the execution goroutine has fully exited
++	closingWorkflows map[string]struct{} // Key: WorkflowId
+ 
+ 	workflowRepo    workflowRepository
+ 	workflowRunRepo workflowRunRepository
+@@ -71,8 +90,8 @@ func (wd *workflowDispatcher) GetStatistics() Statistics {
+ 		PendingRunIds:    make([]string, 0),
+ 		ProcessingRunIds: make([]string, 0),
+ 	}
+-	for _, pendingRunId := range wd.pendingRunQueue {
+-		stats.PendingRunIds = append(stats.PendingRunIds, pendingRunId)
++	for _, pendingTask := range wd.pendingRunQueue {
++		stats.PendingRunIds = append(stats.PendingRunIds, pendingTask.RunId)
+ 	}
+ 	for _, processingRunId := range wd.processingTasks {
+ 		stats.ProcessingRunIds = append(stats.ProcessingRunIds, processingRunId.RunId)
+@@ -112,31 +131,129 @@ func (wd *workflowDispatcher) Shutdown(ctx context.Context) error {
+ 	}
+ 
+ 	wd.booted = false
+-	wd.pendingRunQueue = make([]string, 0)
++	wd.pendingRunQueue = make([]*taskInfo, 0)
+ 	wd.processingTasks = make(map[string]*taskInfo)
++	wd.activeTasks = make(map[string]*taskInfo)
++	wd.closingWorkflows = make(map[string]struct{})
+ 	return nil
+ }
+ 
+-func (wd *workflowDispatcher) Start(ctx context.Context, runId string) error {
++func (wd *workflowDispatcher) Start(ctx context.Context, workflowId string, runId string) error {
+ 	wd.taskMtx.Lock()
+ 	defer wd.taskMtx.Unlock()
+ 
++	if !wd.booted {
++		return fmt.Errorf("workflow dispatcher is not booted")
++	}
++
++	// Close fence: once the ownership of a workflow is closing, no further
++	// generation may enter the queue, regardless of who requested the run.
++	if _, closing := wd.closingWorkflows[workflowId]; closing {
++		return fmt.Errorf("workflow #%s is closing, the new run #%s is rejected", workflowId, runId)
++	}
++
+ 	if _, exists := wd.processingTasks[runId]; exists {
+ 		return fmt.Errorf("workflow run %s is already processing", runId)
+ 	}
+ 
+-	for _, pendingRunId := range wd.pendingRunQueue {
+-		if pendingRunId == runId {
++	for _, pendingTask := range wd.pendingRunQueue {
++		if pendingTask.RunId == runId {
+ 			return fmt.Errorf("workflow run %s is already in the queue", runId)
+ 		}
+ 	}
+ 
+-	wd.pendingRunQueue = append(wd.pendingRunQueue, runId)
++	wd.pendingRunQueue = append(wd.pendingRunQueue, &taskInfo{WorkflowId: workflowId, RunId: runId})
+ 	go func() { wd.tryNextAsync() }()
+ 
+ 	return nil
+ }
+ 
++func (wd *workflowDispatcher) ShutdownWorkflow(ctx context.Context, workflowId string) error {
++	// 1. Raise the close fence, withdraw queued generations and cancel every
++	//    in-flight execution atomically. Cancelling here (before any slow
++	//    database work) guarantees that no node can cross the close boundary
++	//    and publish a certificate/output or trigger a deploy/notification.
++	wd.taskMtx.Lock()
++	wd.closingWorkflows[workflowId] = struct{}{}
++
++	inflightTasks := make([]*taskInfo, 0)
++	for _, task := range wd.activeTasks {
++		if task.WorkflowId == workflowId {
++			inflightTasks = append(inflightTasks, task)
++			task.cancel()
++		}
++	}
++
++	// Withdraw every queued generation of this workflow. Their database status
++	// is corrected by the cancel sweep below, so they can never be dispatched.
++	wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(task *taskInfo, _ int) bool {
++		return task.WorkflowId != workflowId
++	})
++	wd.taskMtx.Unlock()
++
++	// 2. Database-side fence: mark every still active run as canceled. This
++	//    also covers generations whose row was inserted but that were rejected
++	//    by the in-memory fence above.
++	canceledRuns, err := wd.workflowRunRepo.CancelActiveByWorkflowId(ctx, workflowId)
++	if err != nil {
++		return fmt.Errorf("workflow #%s: failed to cancel active runs while closing: %w", workflowId, err)
++	}
++	for _, run := range canceledRuns {
++		wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s was canceled because the workflow is closing", workflowId, run.Id))
++	}
++
++	// 3. Wait for ownership convergence. The wait is intentionally detached
++	//    from the request context so a client disconnect cannot split the
++	//    state halfway, but it is bounded to avoid blocking forever.
++	waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(envShutdownTimeoutSeconds)*time.Second)
++	defer waitCancel()
++
++	for _, task := range inflightTasks {
++		select {
++		case <-task.done:
++		case <-waitCtx.Done():
++			runningRunIds := wd.activeRunIds(workflowId)
++			return fmt.Errorf("workflow #%s: timed out waiting for %d active run(s) to stop [%s]; the deletion has been aborted and can be retried",
++				workflowId, len(runningRunIds), strings.Join(runningRunIds, ","))
++		}
++	}
++
++	// 4. Final sweep: any active row left means a generation slipped in
++	//    concurrently; abort rather than committing a split state.
++	leftRuns, err := wd.workflowRunRepo.CancelActiveByWorkflowId(ctx, workflowId)
++	if err != nil {
++		return fmt.Errorf("workflow #%s: failed to verify active runs while closing: %w", workflowId, err)
++	}
++	if len(leftRuns) > 0 {
++		runningRunIds := lo.Map(leftRuns, func(run *domain.WorkflowRun, _ int) string { return run.Id })
++		return fmt.Errorf("workflow #%s: %d active run(s) are still present [%s]; the deletion has been aborted and can be retried",
++			workflowId, len(runningRunIds), strings.Join(runningRunIds, ","))
++	}
++
++	return nil
++}
++
++func (wd *workflowDispatcher) ReleaseWorkflow(workflowId string) {
++	wd.taskMtx.Lock()
++	defer wd.taskMtx.Unlock()
++
++	delete(wd.closingWorkflows, workflowId)
++}
++
++func (wd *workflowDispatcher) activeRunIds(workflowId string) []string {
++	wd.taskMtx.RLock()
++	defer wd.taskMtx.RUnlock()
++
++	runIds := make([]string, 0)
++	for _, task := range wd.activeTasks {
++		if task.WorkflowId == workflowId {
++			runIds = append(runIds, task.RunId)
++		}
++	}
++	slices.Sort(runIds)
++	return runIds
++}
++
+ func (wd *workflowDispatcher) Cancel(ctx context.Context, runId string) error {
+ 	wd.taskMtx.Lock()
+ 	defer wd.taskMtx.Unlock()
+@@ -173,8 +290,8 @@ func (wd *workflowDispatcher) Cancel(ctx context.Context, runId string) error {
+ 		wd.syslog.Info(fmt.Sprintf("workrun #%s was canceled", task.RunId))
+ 	}
+ 
+-	for i, pendingRunId := range wd.pendingRunQueue {
+-		if pendingRunId == runId {
++	for i, pendingTask := range wd.pendingRunQueue {
++		if pendingTask.RunId == runId {
+ 			wd.pendingRunQueue = append(wd.pendingRunQueue[:i], wd.pendingRunQueue[i+1:]...)
+ 			break
+ 		}
+@@ -207,13 +324,17 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
+ 		}
+ 	}()
+ 
+-	// 尝试继续执行等待队列中的任务
++	// 尝试继续执行等待队列中的任务；activeTasks 与 done 仅在执行协程完全
++	// 退出（含所有收尾回调）后才释放/关闭，ShutdownWorkflow 据此等待所有权收敛
+ 	defer func() {
+ 		wd.taskMtx.Lock()
+ 		delete(wd.processingTasks, task.RunId)
++		delete(wd.activeTasks, task.RunId)
+ 		wd.taskMtx.Unlock()
+ 
+ 		go func() { wd.tryNextAsync() }()
++
++		close(task.done)
+ 	}()
+ 
+ 	// 查询运行实体，并级联更新状态
+@@ -239,6 +360,16 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
+ 		return
+ 	}
+ 
++	// 关闭边界：工作流已进入删除流程时，旧代际不得继续执行，直接落库为取消
++	if workflow.IsClosing() {
++		workflowRun.Status = domain.WorkflowRunStatusTypeCanceled
++		workflowRun.EndedAt = time.Now()
++		if _, err := wd.workflowRunRepo.SaveWithCascading(context.Background(), workflowRun); err != nil {
++			wd.syslog.Error(fmt.Sprintf("failed to cancel workrun #%s of closing workflow #%s", task.RunId, workflow.Id), slog.Any("error", err))
++		}
++		return
++	}
++
+ 	// 初始化工作流引擎
+ 	logsBuf := make(domain.WorkflowLogs, 0)
+ 	we := engine.NewWorkflowEngine()
+@@ -325,12 +456,33 @@ func (wd *workflowDispatcher) tryExecuteAsync(task *taskInfo) {
+ }
+ 
+ func (wd *workflowDispatcher) tryNextAsync() {
+-	wd.taskMtx.RLock()
++	wd.taskMtx.Lock()
++	defer wd.taskMtx.Unlock()
+ 
+-	for _, pendingRunId := range wd.pendingRunQueue {
+-		workflowRun, err := wd.workflowRunRepo.GetById(context.Background(), pendingRunId)
++	if !wd.booted {
++		return
++	}
++
++	// Iterate over a snapshot because queued entries may be withdrawn while we
++	// make repository calls (e.g. by a concurrent workflow shutdown).
++	for _, pendingTask := range slices.Clone(wd.pendingRunQueue) {
++		workflowRun, err := wd.workflowRunRepo.GetById(context.Background(), pendingTask.RunId)
+ 		if err != nil {
+-			wd.syslog.Error(fmt.Sprintf("failed to get workrun #%s record", pendingRunId), slog.Any("error", err))
++			wd.syslog.Error(fmt.Sprintf("failed to get workrun #%s record", pendingTask.RunId), slog.Any("error", err))
++			continue
++		}
++
++		// 关闭边界：工作流已进入删除流程时，撤出该工作流的排队代际，
++		// 其数据库状态由 ShutdownWorkflow 的取消扫描负责纠正
++		if _, closing := wd.closingWorkflows[workflowRun.WorkflowId]; closing {
++			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is withdrawn, because the workflow is closing", workflowRun.WorkflowId, workflowRun.Id))
++			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.WorkflowId != workflowRun.WorkflowId })
++			continue
++		}
++
++		// 排队记录已不是 pending（例如已被取消），丢弃陈旧的队列项
++		if workflowRun.Status != domain.WorkflowRunStatusTypePending {
++			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.RunId != pendingTask.RunId })
+ 			continue
+ 		}
+ 
+@@ -344,33 +496,45 @@ func (wd *workflowDispatcher) tryNextAsync() {
+ 
+ 		if hasSameWorkflowTask {
+ 			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is pending, because tasks that belonging to the same workflow already exists", workflowRun.WorkflowId, workflowRun.Id))
+-		} else if len(wd.processingTasks) >= wd.concurrency && wd.concurrency > 0 {
++			continue
++		}
++
++		if len(wd.processingTasks) >= wd.concurrency && wd.concurrency > 0 {
+ 			wd.syslog.Warn(fmt.Sprintf("workflow #%s's run #%s is pending, because the maximum concurrency (limit: %d) has been reached", workflowRun.WorkflowId, workflowRun.Id, wd.concurrency))
+-		} else {
+-			wd.taskMtx.RUnlock()
++			continue
++		}
+ 
+-			wd.taskMtx.Lock()
+-			ctxRun, ctxCancel := context.WithCancel(context.Background())
+-			task := &taskInfo{WorkflowId: workflowRun.WorkflowId, RunId: workflowRun.Id, ctx: ctxRun, cancel: ctxCancel}
+-			wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(s string, _ int) bool { return s != pendingRunId })
+-			wd.processingTasks[pendingRunId] = task
+-			wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s is being dispatched ...", task.WorkflowId, task.RunId))
+-			wd.taskMtx.Unlock()
++		// 二次确认队列项仍在，避免与撤出/取消竞争
++		if !lo.ContainsBy(wd.pendingRunQueue, func(t *taskInfo) bool { return t.RunId == pendingTask.RunId }) {
++			continue
++		}
+ 
+-			go func() { wd.tryExecuteAsync(task) }()
+-			return
++		ctxRun, ctxCancel := context.WithCancel(context.Background())
++		task := &taskInfo{
++			WorkflowId: workflowRun.WorkflowId,
++			RunId:      workflowRun.Id,
++			ctx:        ctxRun,
++			cancel:     ctxCancel,
++			done:       make(chan struct{}),
+ 		}
+-	}
++		wd.pendingRunQueue = lo.Filter(wd.pendingRunQueue, func(t *taskInfo, _ int) bool { return t.RunId != pendingTask.RunId })
++		wd.processingTasks[pendingTask.RunId] = task
++		wd.activeTasks[pendingTask.RunId] = task
++		wd.syslog.Info(fmt.Sprintf("workflow #%s's run #%s is being dispatched ...", task.WorkflowId, task.RunId))
+ 
+-	wd.taskMtx.RUnlock()
++		go func() { wd.tryExecuteAsync(task) }()
++		return
++	}
+ }
+ 
+ func newWorkflowDispatcher() WorkflowDispatcher {
+ 	return &workflowDispatcher{
+ 		concurrency: envMaxWorkers,
+ 
+-		pendingRunQueue: make([]string, 0),
+-		processingTasks: make(map[string]*taskInfo),
++		pendingRunQueue:  make([]*taskInfo, 0),
++		processingTasks:  make(map[string]*taskInfo),
++		activeTasks:      make(map[string]*taskInfo),
++		closingWorkflows: make(map[string]struct{}),
+ 
+ 		workflowRepo:    repository.NewWorkflowRepository(),
+ 		workflowRunRepo: repository.NewWorkflowRunRepository(),
+diff --git a/internal/workflow/dispatcher/task.go b/internal/workflow/dispatcher/task.go
+index 72aedd38..43c8f290 100644
+--- a/internal/workflow/dispatcher/task.go
++++ b/internal/workflow/dispatcher/task.go
+@@ -10,4 +10,9 @@ type taskInfo struct {
+ 
+ 	ctx    context.Context
+ 	cancel context.CancelFunc
++
++	// done is closed after the execution goroutine (including all of its
++	// completion callbacks) has fully exited. ShutdownWorkflow waits on it to
++	// ensure ownership convergence before a workflow deletion is committed.
++	done chan struct{}
+ }
+diff --git a/internal/workflow/engine/engine.go b/internal/workflow/engine/engine.go
+index 4e2b936a..43ad9b42 100644
+--- a/internal/workflow/engine/engine.go
++++ b/internal/workflow/engine/engine.go
+@@ -182,6 +182,12 @@ func (we *workflowEngine) executeNode(wfCtx *WorkflowContext, node *Node) error
+ 
+ 	we.fireOnNodeEndHooks(wfCtx.ctx, node, execRes)
+ 
++	// 关闭边界：节点执行期间运行被取消（如工作流正在删除）时，迟到的节点
++	// 结果不得再发布输出，直接返回让旧代际停止
++	if err := wfCtx.ctx.Err(); err != nil {
++		return err
++	}
++
+ 	if execRes != nil {
+ 		if execRes.Variables != nil {
+ 			for _, variable := range execRes.Variables {
+diff --git a/internal/workflow/engine/executor.go b/internal/workflow/engine/executor.go
+index 8b7339bd..0788ab74 100644
+--- a/internal/workflow/engine/executor.go
++++ b/internal/workflow/engine/executor.go
+@@ -4,6 +4,8 @@ import (
+ 	"context"
+ 	"log/slog"
+ 	"sync"
++
++	"github.com/certimate-go/certimate/internal/domain"
+ )
+ 
+ type NodeExecutor interface {
+@@ -20,6 +22,26 @@ func (e *nodeExecutor) SetLogger(logger *slog.Logger) {
+ 	e.logger = logger
+ }
+ 
++// buildCertificateSourceSnapshot captures the provenance of a certificate
++// produced by the current node. The snapshot is persisted together with the
++// certificate so that it remains explainable after its owning workflow/run
++// relation fields have been nulled upon workflow deletion.
++func buildCertificateSourceSnapshot(execCtx *NodeExecutionContext) *domain.CertificateSourceSnapshot {
++	snapshot := &domain.CertificateSourceSnapshot{
++		WorkflowId: execCtx.WorkflowId,
++		RunId:      execCtx.RunId,
++		NodeId:     execCtx.Node.Id,
++		NodeName:   execCtx.Node.Data.Name,
++	}
++	if state, ok := execCtx.variables.Get(stateVarKeyWorkflowName); ok {
++		snapshot.WorkflowName = state.ValueString()
++	}
++	if state, ok := execCtx.variables.Get(stateVarKeyRunTrigger); ok {
++		snapshot.RunTrigger = state.ValueString()
++	}
++	return snapshot
++}
++
+ type NodeExecutionContext struct {
+ 	WorkflowContext
+ 
+diff --git a/internal/workflow/engine/executor_bizapply.go b/internal/workflow/engine/executor_bizapply.go
+index 5649dac2..e0a2e0ae 100644
+--- a/internal/workflow/engine/executor_bizapply.go
++++ b/internal/workflow/engine/executor_bizapply.go
+@@ -103,6 +103,11 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
+ 		return execRes, err
+ 	}
+ 
++	// 关闭边界：申请结果跨越取消边界返回时，不得再发布证书或产生后续外部效果
++	if err := execCtx.Context().Err(); err != nil {
++		return execRes, err
++	}
++
+ 	// 保存证书实体
+ 	certificate := &domain.Certificate{
+ 		Source:             domain.CertificateSourceTypeRequest,
+@@ -115,6 +120,7 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
+ 		WorkflowId:         execCtx.WorkflowId,
+ 		WorkflowRunId:      execCtx.RunId,
+ 		WorkflowNodeId:     execCtx.Node.Id,
++		SourceSnapshot:     buildCertificateSourceSnapshot(execCtx),
+ 	}
+ 	certificate.PopulateFromPEM(obtainResp.FullChainCertificate, obtainResp.PrivateKey)
+ 	if certificate, err := ne.certificateRepo.Save(execCtx.Context(), certificate); err != nil {
+@@ -126,6 +132,9 @@ func (ne *bizApplyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeExe
+ 
+ 	// 保存 ARI 替换状态
+ 	if lastCertificate != nil && obtainResp.ARIReplaced {
++		if err := execCtx.Context().Err(); err != nil {
++			return execRes, err
++		}
+ 		lastCertificate.IsRenewed = true
+ 		ne.certificateRepo.Save(execCtx.Context(), lastCertificate)
+ 	}
+diff --git a/internal/workflow/engine/executor_bizdeploy.go b/internal/workflow/engine/executor_bizdeploy.go
+index c519430b..1aaae44f 100644
+--- a/internal/workflow/engine/executor_bizdeploy.go
++++ b/internal/workflow/engine/executor_bizdeploy.go
+@@ -88,6 +88,11 @@ func (ne *bizDeployNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
+ 		}
+ 	}
+ 
++	// 关闭边界：取消边界之后不得再执行部署这类外部效果
++	if err := execCtx.Context().Err(); err != nil {
++		return execRes, err
++	}
++
+ 	// 部署证书
+ 	deployer := certmgmt.NewClient(certmgmt.WithLogger(ne.logger))
+ 	deployReq := &certmgmt.DeployCertificateRequest{
+diff --git a/internal/workflow/engine/executor_biznotify.go b/internal/workflow/engine/executor_biznotify.go
+index bd0a2851..44cdec33 100644
+--- a/internal/workflow/engine/executor_biznotify.go
++++ b/internal/workflow/engine/executor_biznotify.go
+@@ -65,6 +65,11 @@ func (ne *bizNotifyNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
+ 	subject := reMustache.ReplaceAllStringFunc(nodeCfg.Subject, reMustacheReplacer)
+ 	message := reMustache.ReplaceAllStringFunc(nodeCfg.Message, reMustacheReplacer)
+ 
++	// 关闭边界：取消边界之后不得再发送通知这类外部效果
++	if err := execCtx.Context().Err(); err != nil {
++		return execRes, err
++	}
++
+ 	// 推送通知
+ 	notifier := notify.NewClient(notify.WithLogger(ne.logger))
+ 	notifyReq := &notify.SendNotificationRequest{
+diff --git a/internal/workflow/engine/executor_bizupload.go b/internal/workflow/engine/executor_bizupload.go
+index 8bdf41f1..e64b97fd 100644
+--- a/internal/workflow/engine/executor_bizupload.go
++++ b/internal/workflow/engine/executor_bizupload.go
+@@ -173,12 +173,18 @@ func (ne *bizUploadNodeExecutor) Execute(execCtx *NodeExecutionContext) (*NodeEx
+ 		}
+ 	}
+ 
++	// 关闭边界：结果跨越取消边界返回时，不得再发布证书或产生后续外部效果
++	if err := execCtx.Context().Err(); err != nil {
++		return execRes, err
++	}
++
+ 	// 保存证书实体
+ 	certificate := &domain.Certificate{
+ 		Source:         domain.CertificateSourceTypeUpload,
+ 		WorkflowId:     execCtx.WorkflowId,
+ 		WorkflowRunId:  execCtx.RunId,
+ 		WorkflowNodeId: execCtx.Node.Id,
++		SourceSnapshot: buildCertificateSourceSnapshot(execCtx),
+ 	}
+ 	certificate.PopulateFromPEM(certPEM, privkeyPEM)
+ 	if certificate, err := ne.certificateRepo.Save(execCtx.Context(), certificate); err != nil {
+diff --git a/internal/workflow/pbhook.go b/internal/workflow/pbhook.go
+index 8fd6919b..68439155 100644
+--- a/internal/workflow/pbhook.go
++++ b/internal/workflow/pbhook.go
+@@ -36,15 +36,21 @@ func registerWorkflowRecordEvents() {
+ 		return nil
+ 	})
+ 	pb.OnRecordDeleteRequest(domain.CollectionNameWorkflow).BindFunc(func(e *core.RecordRequestEvent) error {
+-		if err := e.Next(); err != nil {
++		// 删除被视为资源所有权的关闭过程，必须在记录真正提交删除之前完成：
++		// 阻止新运行、撤出等待队列、停止当前执行及子进程，并等待所有权收敛。
++		// 任一步骤失败都中止删除并返回错误，保留可重试的完整状态。
++		if err := thisSvcInst().OnWorkflowDeleting(e.Request.Context(), e.Record.Id); err != nil {
++			app.GetLogger().Error(err.Error())
+ 			return err
+ 		}
+ 
+-		if err := onWorkflowRecordDelete(e.Request.Context(), e.App, e.Record); err != nil {
+-			app.GetLogger().Error(err.Error())
++		// 所有权收敛后才提交数据库删除（级联清理运行、输出与日志）
++		if err := e.Next(); err != nil {
+ 			return err
+ 		}
+ 
++		// 删除成功后释放内存关闭边界
++		thisSvcInst().OnWorkflowDeleted(e.Record.Id)
+ 		return nil
+ 	})
+ }
+@@ -52,6 +58,12 @@ func registerWorkflowRecordEvents() {
+ func onWorkflowRecordCreateOrUpdate(_ context.Context, _ core.App, record *core.Record) error {
+ 	scheduler := app.GetScheduler()
+ 
++	// 处于删除关闭流程中的工作流，不得被更新请求重新恢复定时任务
++	if record.GetString("lifecycle") == domain.WorkflowLifecycleClosing.String() {
++		scheduler.Remove(buildPbJobKey(record.Id))
++		return nil
++	}
++
+ 	// 向数据库插入/更新时，同时更新定时任务
+ 	enabled := record.GetBool("enabled")
+ 	trigger := record.GetString("trigger")
+@@ -70,12 +82,3 @@ func onWorkflowRecordCreateOrUpdate(_ context.Context, _ core.App, record *core.
+ 
+ 	return nil
+ }
+-
+-func onWorkflowRecordDelete(_ context.Context, _ core.App, record *core.Record) error {
+-	scheduler := app.GetScheduler()
+-
+-	// 从数据库删除时，同时移除定时任务
+-	scheduler.Remove(buildPbJobKey(record.Id))
+-
+-	return nil
+-}
+diff --git a/internal/workflow/service.go b/internal/workflow/service.go
+index 16ea7e62..3502fe70 100644
+--- a/internal/workflow/service.go
++++ b/internal/workflow/service.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"log/slog"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/pocketbase/dbx"
+@@ -21,14 +22,17 @@ type WorkflowService struct {
+ 
+ 	workflowRepo    workflowRepository
+ 	workflowRunRepo workflowRunRepository
++	certificateRepo certificateRepository
++	deleteLocks     sync.Map // Key: WorkflowId, Value: *sync.Mutex
+ }
+ 
+-func NewWorkflowService(workflowRepo workflowRepository, workflowRunRepo workflowRunRepository) *WorkflowService {
++func NewWorkflowService(workflowRepo workflowRepository, workflowRunRepo workflowRunRepository, certificateRepo certificateRepository) *WorkflowService {
+ 	srv := &WorkflowService{
+ 		dispatcher: dispatcher.GetSingletonDispatcher(),
+ 
+ 		workflowRepo:    workflowRepo,
+ 		workflowRunRepo: workflowRunRepo,
++		certificateRepo: certificateRepo,
+ 	}
+ 	return srv
+ }
+@@ -80,6 +84,11 @@ func (s *WorkflowService) StartRun(ctx context.Context, req *dtos.WorkflowStartR
+ 		return nil, err
+ 	}
+ 
++	// 关闭边界：正在删除的工作流拒绝一切新的手动/定时运行
++	if workflow.IsClosing() {
++		return nil, fmt.Errorf("workflow #%s is being deleted, starting a new run is not allowed", workflow.Id)
++	}
++
+ 	if req.RunTrigger == domain.WorkflowTriggerTypeManual && (workflow.LastRunStatus == domain.WorkflowRunStatusTypePending || workflow.LastRunStatus == domain.WorkflowRunStatusTypeProcessing) {
+ 		return nil, fmt.Errorf("workflow is already pending or processing")
+ 	} else if workflow.GraphContent == nil {
+@@ -101,7 +110,14 @@ func (s *WorkflowService) StartRun(ctx context.Context, req *dtos.WorkflowStartR
+ 		workflowRun = resp
+ 	}
+ 
+-	if err := s.dispatcher.Start(ctx, workflowRun.Id); err != nil {
++	if err := s.dispatcher.Start(ctx, workflow.Id, workflowRun.Id); err != nil {
++		// 关闭竞态：运行记录已落库但被关闭边界拒绝入队，将其收敛为已取消，
++		// 避免留下悬挂的排队代际
++		workflowRun.Status = domain.WorkflowRunStatusTypeCanceled
++		workflowRun.EndedAt = time.Now()
++		if _, saveErr := s.workflowRunRepo.Save(context.WithoutCancel(ctx), workflowRun); saveErr != nil {
++			app.GetLogger().Error(fmt.Sprintf("failed to cancel rejected run #%s of closing workflow #%s", workflowRun.Id, workflow.Id), slog.Any("error", saveErr))
++		}
+ 		return nil, err
+ 	}
+ 
+@@ -134,6 +150,139 @@ func (s *WorkflowService) Shutdown(ctx context.Context) {
+ 	s.dispatcher.Shutdown(ctx)
+ }
+ 
++// acquireDeleteLock returns a release function for the per-workflow lock that
++// serializes concurrent deletion attempts of the same workflow.
++func (s *WorkflowService) acquireDeleteLock(workflowId string) func() {
++	mu, _ := s.deleteLocks.LoadOrStore(workflowId, &sync.Mutex{})
++	lock := mu.(*sync.Mutex)
++	lock.Lock()
++	return lock.Unlock
++}
++
++// OnWorkflowDeleting is the ownership shutdown process that MUST complete
++// successfully before the workflow record is deleted. It persists the close
++// fence, stops future scheduled triggers, preserves certificate provenance
++// and drains every queued or in-flight run (including child processes).
++//
++// It is idempotent. If any stage fails it returns a diagnosable error and the
++// workflow is left in a consistent, fully retryable state (persisted as
++// "closing", cron removed and new runs blocked) rather than half-deleted.
++func (s *WorkflowService) OnWorkflowDeleting(ctx context.Context, workflowId string) error {
++	// 与删除串行：工作流已被并发删除时直接放行，交由后续删除流程返回不存在
++	if _, err := s.workflowRepo.GetById(ctx, workflowId); err != nil {
++		if domain.IsRecordNotFoundError(err) {
++			return nil
++		}
++		return fmt.Errorf("workflow #%s: failed to load before closing: %w", workflowId, err)
++	}
++
++	unlock := s.acquireDeleteLock(workflowId)
++	defer unlock()
++
++	// The drain is intentionally detached from the HTTP request context so a
++	// client disconnect cannot leave the deletion half-applied.
++	bgCtx := context.WithoutCancel(ctx)
++
++	workflow, err := s.workflowRepo.GetById(bgCtx, workflowId)
++	if err != nil {
++		if domain.IsRecordNotFoundError(err) {
++			return nil
++		}
++		return fmt.Errorf("workflow #%s: failed to load before closing: %w", workflowId, err)
++	}
++
++	// 1. 持久化关闭边界：阻止重启后的调度恢复以及一切新的手动/定时运行
++	if err := s.workflowRepo.MarkClosing(bgCtx, workflowId); err != nil {
++		return fmt.Errorf("workflow #%s: failed to mark as closing: %w", workflowId, err)
++	}
++
++	// 2. 撤出定时任务，杜绝新的定时触发
++	app.GetScheduler().Remove(buildPbJobKey(workflowId))
++
++	// 3. 为按关系策略保留的证书补齐来源快照，避免删除后成为无法解释的孤立记录
++	if err := s.backfillCertificateSnapshots(bgCtx, workflow); err != nil {
++		return err
++	}
++
++	// 4. 撤出等待队列、取消当前执行及其子进程，并等待活动所有权收敛
++	if err := s.dispatcher.ShutdownWorkflow(bgCtx, workflowId); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// OnWorkflowDeleted releases the in-memory close fence after the workflow
++// record (and its cascade data) has been deleted successfully.
++func (s *WorkflowService) OnWorkflowDeleted(workflowId string) {
++	s.dispatcher.ReleaseWorkflow(workflowId)
++}
++
++// backfillCertificateSnapshots writes a provenance snapshot to every retained
++// certificate that still belongs to the workflow and does not have one yet, so
++// that nulling workflow/run relations on deletion does not orphan it.
++func (s *WorkflowService) backfillCertificateSnapshots(ctx context.Context, workflow *domain.Workflow) error {
++	certificates, err := s.certificateRepo.ListByWorkflowId(ctx, workflow.Id)
++	if err != nil {
++		return fmt.Errorf("workflow #%s: failed to list certificates for source snapshot: %w", workflow.Id, err)
++	}
++	if len(certificates) == 0 {
++		return nil
++	}
++
++	runs, err := s.workflowRunRepo.ListByWorkflowId(ctx, workflow.Id)
++	if err != nil {
++		return fmt.Errorf("workflow #%s: failed to list runs for source snapshot: %w", workflow.Id, err)
++	}
++
++	changed := 0
++	for _, certificate := range certificates {
++		if certificate.SourceSnapshot != nil && certificate.SourceSnapshot.WorkflowId != "" {
++			continue
++		}
++
++		snapshot := &domain.CertificateSourceSnapshot{
++			WorkflowId:   workflow.Id,
++			WorkflowName: workflow.Name,
++			RunId:        certificate.WorkflowRunId,
++			NodeId:       certificate.WorkflowNodeId,
++		}
++
++		if run := findWorkflowRun(runs, certificate.WorkflowRunId); run != nil {
++			snapshot.RunTrigger = run.Trigger.String()
++			if run.Graph != nil && certificate.WorkflowNodeId != "" {
++				if node, ok := run.Graph.GetNodeById(certificate.WorkflowNodeId); ok {
++					snapshot.NodeName = node.Data.Name
++				}
++			}
++		}
++
++		certificate.SourceSnapshot = snapshot
++		if _, err := s.certificateRepo.Save(ctx, certificate); err != nil {
++			return fmt.Errorf("workflow #%s: failed to persist source snapshot for certificate #%s: %w", workflow.Id, certificate.Id, err)
++		}
++		changed++
++	}
++
++	if changed > 0 {
++		app.GetLogger().Info(fmt.Sprintf("workflow #%s: source snapshot backfilled for %d certificate(s)", workflow.Id, changed))
++	}
++
++	return nil
++}
++
++func findWorkflowRun(runs []*domain.WorkflowRun, runId string) *domain.WorkflowRun {
++	if runId == "" {
++		return nil
++	}
++	for _, run := range runs {
++		if run.Id == runId {
++			return run
++		}
++	}
++	return nil
++}
++
+ func (s *WorkflowService) cleanupHistoryRuns(ctx context.Context) error {
+ 	globalSettingsForPersistence := settings.GetGlobalSettingsForPersistence()
+ 	if globalSettingsForPersistence.WorkflowRunsRetentionMaxDays != 0 {
+diff --git a/internal/workflow/service_deps.go b/internal/workflow/service_deps.go
+index 89481b91..e364db8d 100644
+--- a/internal/workflow/service_deps.go
++++ b/internal/workflow/service_deps.go
+@@ -12,11 +12,19 @@ type workflowRepository interface {
+ 	ListEnabledScheduled(ctx context.Context) ([]*domain.Workflow, error)
+ 	GetById(ctx context.Context, id string) (*domain.Workflow, error)
+ 	Save(ctx context.Context, workflow *domain.Workflow) (*domain.Workflow, error)
++	MarkClosing(ctx context.Context, id string) error
+ }
+ 
+ type workflowRunRepository interface {
+ 	GetById(ctx context.Context, id string) (*domain.WorkflowRun, error)
+ 	Save(ctx context.Context, workflowRun *domain.WorkflowRun) (*domain.WorkflowRun, error)
+ 	SaveWithCascading(ctx context.Context, workflowRun *domain.WorkflowRun) (*domain.WorkflowRun, error)
++	ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error)
++	CancelActiveByWorkflowId(ctx context.Context, workflowId string) ([]*domain.WorkflowRun, error)
+ 	DeleteWithExprs(ctx context.Context, exprs ...dbx.Expression) (int, error)
+ }
++
++type certificateRepository interface {
++	ListByWorkflowId(ctx context.Context, workflowId string) ([]*domain.Certificate, error)
++	Save(ctx context.Context, certificate *domain.Certificate) (*domain.Certificate, error)
++}
+diff --git a/internal/workflow/service_inst.go b/internal/workflow/service_inst.go
+index d0337fe7..4652f715 100644
+--- a/internal/workflow/service_inst.go
++++ b/internal/workflow/service_inst.go
+@@ -16,6 +16,7 @@ func thisSvcInst() *WorkflowService {
+ 		thisSvc = NewWorkflowService(
+ 			repository.NewWorkflowRepository(),
+ 			repository.NewWorkflowRunRepository(),
++			repository.NewCertificateRepository(),
+ 		)
+ 	})
+ 	return thisSvc
+diff --git a/migrations/1791849600_upgrade_v0.4.36.go b/migrations/1791849600_upgrade_v0.4.36.go
+new file mode 100644
+index 00000000..97bb1e52
+--- /dev/null
++++ b/migrations/1791849600_upgrade_v0.4.36.go
+@@ -0,0 +1,94 @@
++package migrations
++
++import (
++	"errors"
++
++	"github.com/pocketbase/pocketbase/core"
++	m "github.com/pocketbase/pocketbase/migrations"
++)
++
++func init() {
++	m.Register(func(app core.App) error {
++		tracer := NewTracer("v0.4.36")
++		tracer.Printf("go ...")
++
++		// update collection `workflow`
++		//   - add field `lifecycle`
++		//
++		// `lifecycle` is a persisted ownership fence. The empty value means an
++		// ordinary, active workflow; "closing" means the workflow is being
++		// deleted and must reject new manual/scheduled runs, while in-flight
++		// runs are drained before the record itself is committed to deletion.
++		{
++			collection, err := app.FindCollectionByNameOrId("tovyif5ax6j62ur")
++			if err != nil {
++				return err
++			}
++
++			if collection.Fields.GetByName("lifecycle") == nil {
++				if err := collection.Fields.AddMarshaledJSONAt(len(collection.Fields), []byte(`{
++					"autogeneratePattern": "",
++					"hidden": false,
++					"id": "wflc2026aa",
++					"max": 20,
++					"min": 0,
++					"name": "lifecycle",
++					"pattern": "",
++					"presentable": false,
++					"primaryKey": false,
++					"required": false,
++					"system": false,
++					"type": "text"
++				}`)); err != nil {
++					return err
++				}
++
++				if err := app.Save(collection); err != nil {
++					return err
++				}
++
++				tracer.Printf("collection '%s' updated", collection.Name)
++			}
++		}
++
++		// update collection `certificate`
++		//   - add field `sourceSnapshot`
++		//
++		// Certificates are intentionally kept when their owning workflow/run is
++		// deleted (both relations use cascadeDelete=false and are therefore
++		// nulled on deletion). The snapshot preserves enough provenance so that
++		// such a certificate does not become an unexplainable orphan.
++		{
++			collection, err := app.FindCollectionByNameOrId("4szxr9x43tpj6np")
++			if err != nil {
++				return err
++			}
++
++			if collection.Fields.GetByName("sourceSnapshot") == nil {
++				if err := collection.Fields.AddMarshaledJSONAt(len(collection.Fields), []byte(`{
++					"hidden": false,
++					"id": "csnap2026aa",
++					"maxSize": 200000,
++					"name": "sourceSnapshot",
++					"presentable": false,
++					"required": false,
++					"system": false,
++					"type": "json"
++				}`)); err != nil {
++					return err
++				}
++
++				if err := app.Save(collection); err != nil {
++					return err
++				}
++
++				tracer.Printf("collection '%s' updated", collection.Name)
++			}
++		}
++
++		tracer.Printf("done")
++		return nil
++	}, func(app core.App) error {
++		return errors.ErrUnsupported
++	})
++}

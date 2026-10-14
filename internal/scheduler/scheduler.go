@@ -15,7 +15,7 @@ func Setup() {
 	acmeAccountRepo := repository.NewACMEAccountRepository()
 	certificateRepo := repository.NewCertificateRepository()
 
-	workflowSvc := workflow.NewWorkflowService(workflowRepo, workflowRunRepo)
+	workflowSvc := workflow.NewWorkflowService(workflowRepo, workflowRunRepo, certificateRepo)
 	certificateSvc := certificate.NewCertificateService(acmeAccountRepo, certificateRepo)
 
 	if err := initWorkflowScheduler(workflowSvc); err != nil {
