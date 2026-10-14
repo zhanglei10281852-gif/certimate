@@ -1,0 +1,3006 @@
+diff --git a/.trae/specs/cert-revocation-attempt/review.md b/.trae/specs/cert-revocation-attempt/review.md
+new file mode 100644
+index 00000000..071f7e33
+--- /dev/null
++++ b/.trae/specs/cert-revocation-attempt/review.md
+@@ -0,0 +1,95 @@
++# 证书吊销去重与结果收敛 - 独立审查
++
++- [x] CP-1: ACME 调用前已持久化尝试与所有者
++  - **Type**: `rule`
++  - **Covers**: AC-1 / TR-1.2 / TR-3.1
++  - **Evidence**: R1 逐行确认唯一 CA 调用点 revocation.go:75 之前存在事务建 processing/prepared 与 calling 落库；calling Save 失败即 return 不调用；TestRevokePersistsAttemptBeforeCACallAndConverges 在 CA 调用内断言记录状态；R1/R2 加固补两条持久化故障用例（createErr、saveFailures）断言 calls=0。**pass**
++
++- [x] CP-2: 同一证书并发请求只产生一次 ACME 调用且结果一致
++  - **Type**: `rule`
++  - **Covers**: AC-2 / TR-3.1
++  - **Evidence**: R1 确认请求入口与启动恢复共用 revokeFlights（key=certificateId），事务 check-then-insert 兜底；TestRevokeConcurrentRequestsShareSingleCACall 在调用闸门处等待 5 个请求，断言 calls=1、尝试记录=1、错误全 nil。**pass**
++
++- [x] CP-3: CA 4xx 明确拒绝落定 failed 并可经现有入口重新发起
++  - **Type**: `rule`
++  - **Covers**: AC-3 / TR-2.1 / TR-3.1
++  - **Evidence**: 分类器 4xx→failed（含 errors.As 穿透 lego 包装）；TestRevokeExplicitRejectionFailsAndAllowsNewAttempt 断言 failed/403、isRevoked 保持 false、普通请求产生第二条尝试且 calls=2。**pass**
++
++- [x] CP-4: 远端结果未知时持久化 unknown、阻断盲重发、confirm=true 才开启新尝试
++  - **Type**: `rule`
++  - **Covers**: AC-4 / TR-2.1 / TR-3.1 / TR-4.1
++  - **Evidence**: 5xx/Deadline/Canceled/net.Error/兜底均 unknown；TestRevokeUnknownBlocksBlindResendUntilConfirmed 断言 1→(无 confirm 不增调用不建记录)→confirm 后 2；遗留 calling 经 TestCallingLeftoverBecomesUnknownWithoutCallingCA 与恢复测试断言零调用置 unknown；409 经 resp.Err→_api ClientResponseError.status 链路打通。**pass**
++
++- [x] CP-5: CA 成功后本地保存失败只做本地收敛、不再调用 CA（含证书已删除）
++  - **Type**: `rule`
++  - **Covers**: AC-5 / TR-3.1
++  - **Evidence**: TestRevokeSucceededButLocalSaveFailsConvergesWithoutSecondCall（首败后第二次请求 calls 仍 1、isRevoked=true、converged=true）；TestSucceededAttemptWithDeletedCertificateIsConverged（证书删除→零调用标记 converged）。**pass**
++
++- [x] CP-6: prepared 遗留可被重启实例安全接管（仅一次调用）；calling 遗留置 unknown
++  - **Type**: `rule`
++  - **Covers**: AC-6 / TR-3.1
++  - **Evidence**: TestPreparedLeftoverIsSafelyTakenOver（复用同一记录、owner 改写、calls=1）；启动恢复混合测试断言 prepared 接管 + calling→unknown + unconverged 收敛总 calls=1；R2 新增"证书已删除的 processing 遗留落终态不重复入队"用例。**pass**
++
++- [x] CP-7: alreadyRevoked 按成功收敛且后续保持既有"已吊销"拒绝语义
++  - **Type**: `rule`
++  - **Covers**: AC-7 / AC-10 / TR-2.1
++  - **Evidence**: 分类器优先判 alreadyRevoked→succeeded；TestAlreadyRevokedResponseConvergesLocally 断言收敛、calls=1、第二次请求返回逐字一致的 "could not revoke a certificate which is already revoked"。**pass**
++
++- [x] CP-8: isRevoked 仅由成功尝试收敛置位，列表/统计/工作流跳过读取同一持久结果
++  - **Type**: `rule`
++  - **Covers**: AC-8 / TR-3.2
++  - **Evidence**: grep 确认生产写入口仅 revocation.go 收敛函数；statistics.go、executor_bizapply.go 只读未改；前端未知标识来自 certificate_revocation 记录；unknown/failed 期间 isRevoked=false。**pass**
++
++- [x] CP-9: 未知状态在列表/详情可见、可诊断，并提供显式重新确认交互
++  - **Type**: `rule`
++  - **Covers**: AC-9 / TR-5.1
++  - **Evidence**: R1 静态走查：列表有效期列 warning 标识+Tooltip(时间/errorMessage)、菜单切换"重新确认吊销"+风险弹窗+confirm=true、409 warning 通知并刷新；详情 warning Tag；中英文案齐备；TS strict 无违规。npm build 未运行（见 CP-12）。**pass（静态）**
++
++- [x] CP-10: 下载、非本系统签发拒绝、申请/工作流链路兼容性
++  - **Type**: `rule`
++  - **Covers**: AC-10
++  - **Evidence**: 下载链路零改动；两条拒绝文案逐字保持并有测试（TestRevokeCompatibilityGuards）；非本系统签发在任何尝试逻辑前拦截（零尝试零调用）；构造函数签名不变，routes/scheduler 装配不受影响。**pass**
++
++- [x] CP-11: 迁移可升级、集合字段/索引正确、启动恢复可执行
++  - **Type**: `rule`
++  - **Covers**: AC-11 / TR-1.1 / TR-4.2
++  - **Evidence**: R1 核对版本号 1791849600 最高、11 字段三处一一对应、索引 DDL 合 PB 既有风格、幂等守卫、down=ErrUnsupported；恢复随 scheduler.Setup 在 e.Next() 前执行一次，空集合无副作用无 goroutine。**pass**
++
++- [ ] CP-12: 全量构建与测试通过（go build/vet/test、npm run build）
++  - **Type**: `rule`
++  - **Covers**: AC-10 / AC-11 / NFR-1 / TR-6.1
++  - **Evidence**: **blocked** — R1 与 R2 两次独立审查、主会话多次尝试，任何子进程（含 `go version`、`echo hello`、`where.exe go`）均返回 3221225794（0xC0000142 STATUS_DLL_INIT_FAILED），命令无法执行。替代证据：gopls 与 TypeScript 语言服务对全部 21 个改动/新增文件语义诊断均为 0；两轮全新上下文逐行走查（含 lego v5.3.1、PocketBase v0.39.10、x/sync v0.22.0 实际源码核对）未发现编译/类型/测试断言问题。需在可启动进程的环境复跑：`go build ./...`、`go vet ./...`、`go test ./...`、`ui` 下 `npm run build`。
++
++- [x] CP-U1: 状态机覆盖度与"宁可未知、不可盲发"的保守性
++  - **Type**: `rubric`
++  - **Covers**: AC-12 / TR-2.2 / TR-3.3
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 存在错误/边界导致盲重发或状态悬空；3 = 主分支覆盖；5 = 全部错误形态与遗留/并发/删除边界均有确定归宿，默认 unknown
++  - **Pass Threshold**: >= 4
++  - **Evidence**: R1 评分 **5/5**：全部入口分支有确定归宿，默认 unknown，无盲重发路径；R2 加固删除证书遗留、panic 边界后覆盖更完整。仅多实例 CAS（F1）在 spec 明确 Non-Goal 之外。**pass**
++
++- [x] CP-U2: 分层一致性与诊断信息质量
++  - **Type**: `rubric`
++  - **Covers**: AC-13
++  - **Scale**: 1-5
++  - **Anchors**: 1 = 分层混乱、无诊断；3 = 基本可用；5 = 沿用现有模式且尝试记录足以排障
++  - **Pass Threshold**: >= 4
++  - **Evidence**: R1 评分 **5/5**：沿用 repository/service/handler/migration 既有模式；owner/stage/heartbeat/起止时间/错误三元组/converged 字段齐备，关键迁移点有 slog。**pass**
++
++## Review History
++
++### Review R1
++- **Result**: `blocked`（全部实质检查点 pass；CP-12 因环境 Shell 故障 blocked；无 actionable 发现，6 条 advisory：F1 多实例接管 CAS、F2 缺失证书 processing 遗留无终态、F3 confirm 并发搭车、F4 singleflight panic 毒化、F5 持久化故障缺测试、F6 注释误导）
++- **Evidence**: 独立子代理全新上下文，通读全部产物与 lego/PB/backoff 实际依赖源码；命令 `go version`/`go build`/`echo hello` 均 0xC0000142；grep 证实唯一 CA 调用点与 isRevoked 唯一写入口。
++- **Blocked By**: 执行环境无法启动任何子进程。
++- **Resume When**: Shell 恢复后复跑 CP-12 命令。
++- **处置**: F2/F4/F5/F6 已实现并补测试；F1（spec Non-Goal）与 F3（无重复 CA 风险）明确不改。
++
++### Review R2
++- **Result**: `blocked`（加固本身 pass，无回归、无 actionable；CP-12 仍因环境 blocked）
++- **Evidence**: 独立子代理全新上下文复审 F2/F4/F5/F6；对照 x/sync@v0.22.0 源码确认 fn 内 recover 后 call 正常完成、key 释放、等待者收到同一普通 error；逐行验证 3 个新测试断言与代码路径一致；未发现导入/闭包/死代码回归。新增 3 条 nit 级 advisory（F4 注释精确性已即时采纳修正；stage 枚举未来扩展复核；close Save 持续失败属环境 best-effort），均不阻塞。
++- **Blocked By**: 同 R1（0xC0000142）。
++- **Resume When**: 同 R1。
++
++### 总体结论
++代码与规格层面：**通过**（CP-1~CP-11、CP-U1、CP-U2 均有独立静态证据）。唯一未闭环项为 CP-12 的命令行构建/测试执行，阻塞原因为当前环境无法启动进程，与代码无关；环境恢复后运行上述四条命令即可完成最终验收。
+diff --git a/.trae/specs/cert-revocation-attempt/spec.md b/.trae/specs/cert-revocation-attempt/spec.md
+new file mode 100644
+index 00000000..cb3dfffb
+--- /dev/null
++++ b/.trae/specs/cert-revocation-attempt/spec.md
+@@ -0,0 +1,199 @@
++# 证书吊销去重与结果收敛 - 产品需求文档
++
++## Overview
++- **Summary**: 为管理员手动吊销证书引入"先持久化吊销尝试、再调用 ACME"的确定性流程：持久化吊销尝试记录及其所有者，同一证书的并发请求复用/观察同一尝试；按 CA 响应把尝试落定为成功、确定失败或结果未知三类终态，并提供崩溃接管、本地收敛、显式重新确认与客户端可诊断能力。
++- **Purpose**: 消除"超时/页面报错后因本地仍显示未吊销而向 CA 重复发送吊销请求"的风险；保证 CA 已成功但本地保存失败时不再重复调用 CA 即可完成本地状态收敛；保证远端结果未知时不盲重发。
++- **Target Users**: 系统管理员（发起吊销、观察吊销状态、在未知状态下显式重新确认的人）。
++
++## Goals
++- 调用 ACME 吊销接口之前，持久化吊销尝试及其当前所有者；同一证书的并发吊销请求复用或观察同一尝试。
++- 区分三类结果：CA 明确成功（含 `alreadyRevoked`）、CA 明确拒绝（确定失败，可按现有入口重新发起）、远端结果未知（超时/连接中断/5xx/进程在调用途中退出）。
++- CA 已明确成功但本地 `isRevoked` 保存失败时，恢复流程只做本地收敛，不再调用 CA。
++- 所有者在真正发起 ACME 调用之前退出（崩溃/重启）时，重启后的实例可以安全接管该尝试。
++- 未知状态对客户端可见、可诊断（时间、原因），禁止自动盲重发；只有管理员显式重新确认才能开启新的尝试。
++- 吊销状态转换、证书列表、统计、工作流"是否跳过旧证书"的判断来自同一份持久结果（证书记录的 `isRevoked`，仅由成功尝试的收敛动作置位）。
++
++## Non-Goals
++- 不改造工作流自动申请/续期链路，不新增自动吊销能力（仅管理员手动吊销入口）。
++- 不引入多实例集群分布式锁；PocketBase 为内嵌 SQLite 单实例部署，跨进程安全由"持久化检查 + 事务"兜底，并发协调以进程内 singleflight 为主。
++- 不向 CA 主动查询吊销结果（ACME 无标准吊销查询接口）；未知状态只能等待显式重新确认。
++- 不改变证书下载、删除、上传、申请、部署等既有功能语义。
++
++## Background & Context
++- 现状入口：`POST /api/certificates/{id}/revoke` → [certificates.go](file:///f:/swe/098833/project-02/internal/rest/handlers/certificates.go) → [service.go `RevokeCertificate`](file:///f:/swe/098833/project-02/internal/certificate/service.go#L219-L257)。
++- 现状流程：读证书 → 校验（非本系统签发拒绝、已吊销拒绝）→ 构造 ACME 客户端 → 调用 [`ACMEClient.RevokeCertificate`](file:///f:/swe/098833/project-02/internal/certacme/client_revoke.go#L14-L25) → 成功后才 `certificate.IsRevoked=true` 并 Save。
++- 现状缺陷：
++  1. ACME 调用前无任何持久化，超时/断连/页面报错后本地仍为未吊销，管理员重复点击会重复向 CA 发送吊销请求；
++  2. 并发点击无协调，多个请求可同时通过 `IsRevoked` 检查并重复调用 CA；
++  3. CA 成功但本地 Save 失败时，再次操作会再次调用 CA（只能依赖 CA 返回 alreadyRevoked 兜底）；
++  4. 进程在调用过程中退出后无恢复依据；
++  5. 无"未知"状态，客户端无法区分"未吊销"与"吊销结果未知"。
++- 依赖的错误形态（lego v5.3.1）：CA 明确应答为 `*acme.ProblemDetails`（含 HTTPStatus、Type、Detail），`alreadyRevoked` 为 `urn:ietf:params:acme:error:alreadyRevoked`；超时（`context.DeadlineExceeded`）、连接中断（网络错误/EOF/TLS 错误）、进程退出不会携带 ProblemDetails，属结果未知。
++- 持久化使用 PocketBase 迁移建表（参考 v0.4.3 增加字段、v0.4.15 修改集合的写法）；仓储模式参考 [certificate.go](file:///f:/swe/098833/project-02/internal/repository/certificate.go)。
++- `isRevoked` 的现有消费方：[统计 SQL](file:///f:/swe/098833/project-02/internal/repository/statistics.go#L59)、[工作流跳过旧证书判断](file:///f:/swe/098833/project-02/internal/workflow/engine/executor_bizapply.go#L214)、前端证书列表/详情。本次保证这些消费方读到的仍然是唯一权威结果，不要求它们改判。
++
++## Functional Requirements
++
++- **FR-1（尝试先持久化）**：在发起 ACME 吊销调用之前，必须先在新集合 `certificate_revocation` 中持久化一条尝试记录，包含证书引用、状态 `processing`、阶段 `prepared`、当前所有者标识（进程级唯一）、心跳时间、开始时间；没有持久化尝试不得调用 ACME。
++
++- **FR-2（并发复用/观察）**：同一证书的并发吊销请求必须复用同一个尝试：进程内通过 singleflight 让并发调用方共享同一执行过程并得到一致结果；尝试记录是唯一事实来源。不得因并发产生两次 ACME 吊销调用。
++
++- **FR-3（阶段协议与接管）**：真正调用 ACME 前将同一记录更新为阶段 `calling` 并刷新心跳。启动（服务启动恢复）或按需处理时发现 `processing` 遗留记录：
++  - 阶段为 `prepared`（所有者在真正调用前退出）→ 重启后的实例可安全接管：改写所有者后执行一次吊销流程；
++  - 阶段为 `calling`（调用途中退出，远端结果未知）→ 不得自动重发，置为 `unknown` 并保留诊断信息。
++
++- **FR-4（结果分类与落定）**：ACME 调用结果分类如下，终态必须持久化（结束时间、诊断字段）：
++  - 成功（nil 错误）→ `succeeded`；
++  - CA 返回 `alreadyRevoked` → 视为远端已吊销，按成功处理并本地收敛；
++  - CA 明确拒绝（携带 `*acme.ProblemDetails` 且 HTTP 4xx）→ `failed`，记录错误类型/状态码/消息，证书保持未吊销，允许经现有吊销入口重新发起（产生新尝试记录）；
++  - 超时、`context` 取消、连接中断、TLS/EOF 等网络错误、HTTP 5xx ProblemDetails、以及其他无法确认远端结果的错误 → `unknown`，记录错误类型/消息；
++  - ACME 调用前的本地错误（账户不存在、客户端初始化失败等，确定未触达 CA）→ `failed`，允许重新发起。
++  - 分类保守原则：任何不能确定为"成功"或"明确 4xx 拒绝"的错误一律归入 `unknown`。
++
++- **FR-5（本地收敛不重复调用 CA）**：尝试落定 `succeeded` 后执行本地收敛：置证书 `isRevoked=true` 并保存，成功后标记尝试 `converged=true`。若证书保存失败，尝试保持 `succeeded/converged=false`；后续请求命中该尝试时、以及启动恢复时，只重试本地保存，不再调用 ACME。证书记录已被删除（not found）视为已收敛。
++
++- **FR-6（未知状态阻断与显式重新确认）**：当证书最近一次尝试为 `unknown` 时：
++  - 普通吊销请求不得调用 CA，返回可识别的错误（HTTP 业务码 409 及诊断消息）；
++  - 仅当请求显式携带重新确认标记（`confirm=true`）时，才允许开启一条新的尝试并调用 ACME；
++  - `failed` 终态不阻断，普通请求即可开启新尝试；`succeeded` 终态只做幂等收敛/返回。
++
++- **FR-7（执行上下文隔离）**：吊销的 ACME 调用使用脱离 HTTP 请求生命周期的后台上下文（带有限超时），避免管理员关闭页面/请求取消直接掐断在途调用；调用方页面提前离开后，终态仍被持久化，可被后续查询观察到。
++
++- **FR-8（启动恢复）**：服务启动时扫描吊销尝试集合并一次性恢复：`prepared` 遗留经同一 singleflight 入口接管执行；`calling` 遗留置 `unknown`；`succeeded` 且未收敛的仅做本地收敛。恢复过程不得产生重复 ACME 调用。
++
++- **FR-9（客户端可见与可诊断）**：前端证书列表与详情必须能展示最近一次尝试的未知状态（独立标识/标签与提示，包含时间与原因），并提供"显式重新确认吊销"的操作，确认后以 `confirm=true` 调用；明确失败后现有"吊销证书"入口仍可直接重新发起。中英文案齐备。
++
++- **FR-10（兼容性）**：
++  - 未吊销证书的下载行为保持不变；
++  - 已吊销证书再次吊销仍返回既有的拒绝错误（"could not revoke a certificate which is already revoked"）；
++  - 非本系统签发证书的拒绝语义不变；
++  - 普通证书申请、续期、无需吊销的工作流行为不变；
++  - 证书统计、工作流跳过旧证书继续读取证书记录的 `isRevoked`；该字段只能由成功尝试的收敛动作置为 true，unknown/failed 期间保持 false。
++
++## Non-Functional Requirements
++
++- **NFR-1（可构建性）**：后端 `go build ./...`、`go vet ./...`、`go test ./...` 通过；前端 `npm run build`（tsc + vite）通过。
++- **NFR-2（可测试性）**：错误分类与尝试状态决策为纯函数/可注入依赖的编排逻辑，具备不依赖数据库的单元测试覆盖（分类表、状态机决策、fake ACME/fake 仓储）。
++- **NFR-3（可诊断性）**：每次尝试持久化所有者、阶段、心跳、起止时间、错误类型/状态码/消息与收敛标志，服务端日志记录关键迁移点。
++- **NFR-4（迁移安全）**：新集合通过版本化迁移创建，字段/索引齐全；已存在环境升级与全新初始化都能正常启动；迁移具备与现有迁移一致的幂等风格。
++- **NFR-5（最小影响面）**：复用现有 repository/service/handler/migration 分层与命名风格，不改动无关链路。
++
++## Constraints
++- **Technical**: Go 1.25；PocketBase v0.39.10（core.TextField/BoolField/NumberField/DateField、RunInTransaction）；lego v5.3.1（acme.ProblemDetails）；React + Ant Design 前端；PocketBase superuser 鉴权下前端可直接读取新集合。
++- **Business**: 不改变现有 REST 路径与请求/响应基本形态，仅在请求体增加可选 `confirm` 字段、响应 data 增加尝试状态信息；错误仍经 `resp.Err` 返回。
++- **Dependencies**: 依赖迁移机制创建集合；依赖进程启动钩子（scheduler.Setup）执行恢复。
++
++## Assumptions
++- 单实例部署为主；并发协调以进程内 singleflight 为准，持久化事务检查用于跨进程/重启兜底。
++- ACME 吊销为单次快速 HTTP 调用，后台上下文超时取固定常量（60 秒）；超时即按 unknown 处理，符合"不盲重发"原则。
++- `alreadyRevoked` 表示远端确定已吊销，本地收敛为 isRevoked=true 是安全且幂等的。
++- 前端以 superuser 身份访问 PocketBase，新集合默认（仅 superuser）API 规则即可被前端只读访问。
++
++## Acceptance Criteria
++
++### AC-1: ACME 调用前持久化尝试与所有者
++- **Type**: `rule`
++- **Given**: 一张本系统签发、未吊销的证书
++- **When**: 管理员发起吊销
++- **Then**: 在任何 ACME 吊销网络调用发生之前，`certificate_revocation` 中已存在该证书的尝试记录（status=processing、stage=prepared、owner 非空、heartbeat/startedAt 已写）；若记录创建失败则不会调用 ACME
++- **Pass Condition**: 代码路径证明"先建记录后调用"顺序成立，且不存在绕过该记录直接调用 ACME 的吊销路径；单元测试（fake 调用器）断言调用 ACME 前已有持久化记录
++- **Evidence**: 代码审查、单元测试输出
++
++### AC-2: 并发请求复用同一尝试且只调用一次 CA
++- **Type**: `rule`
++- **Given**: 同一证书同时到达 N 个吊销请求
++- **When**: 吊销流程执行
++- **Then**: N 个请求共享同一尝试记录与同一次执行，ACME 调用恰好发生一次，所有调用方得到一致终态
++- **Pass Condition**: 并发单元测试中 fake ACME 调用计数为 1，且尝试记录只有一条 processing 记录
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-3: CA 明确拒绝记录确定失败且可重新发起
++- **Type**: `rule`
++- **Given**: ACME 返回携带 ProblemDetails 的 4xx 拒绝（如 unauthorized）
++- **When**: 吊销流程落定
++- **Then**: 尝试为 failed（含错误类型/状态码/消息），证书 isRevoked 保持 false；随后普通吊销请求可创建一条新尝试并再次调用 ACME
++- **Pass Condition**: 分类单元测试覆盖 4xx → failed；编排测试断言 failed 后新请求产生第二条尝试记录并再次调用；接口返回错误（保持既有错误返回形态）
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-4: 结果未知时持久化未知、阻断盲重发、显式确认后重试
++- **Type**: `rule`
++- **Given**: 吊销调用发生超时/连接中断/5xx，或遗留 calling 记录
++- **When**: 流程落定或启动恢复执行
++- **Then**: 最近尝试为 unknown（含诊断信息）且 isRevoked 保持 false；此后不带 confirm 的吊销请求不调用 ACME 并返回业务码 409；携带 confirm=true 时才创建新尝试并调用一次 ACME
++- **Pass Condition**: 分类单元测试覆盖 DeadlineExceeded/网络错误/5xx/未知错误 → unknown；编排测试断言 unknown 后普通请求 ACME 调用数不增加、confirm=true 后增加一次；遗留 calling 记录被恢复为 unknown
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-5: CA 成功后本地保存失败仅收敛本地、不再调用 CA
++- **Type**: `rule`
++- **Given**: ACME 返回成功，但证书 isRevoked 保存首次失败（尝试 succeeded/converged=false）
++- **When**: 再次对该证书发起吊销请求，或服务启动恢复执行
++- **Then**: 不发生任何 ACME 调用，仅重试本地保存使 isRevoked=true、尝试 converged=true；证书记录已删除时直接视为已收敛
++- **Pass Condition**: 编排测试模拟 Save 首次失败、后续成功，断言 ACME 总调用次数为 1、最终 isRevoked=true；not-found 分支断言收敛完成且无 ACME 调用
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-6: prepared 阶段退出可被重启实例安全接管
++- **Type**: `rule`
++- **Given**: 一条 processing/prepared 遗留尝试（所有者已不存在），且从未进入 calling
++- **When**: 服务启动恢复
++- **Then**: 新实例接管所有者并只执行一次吊销流程；同一证书不会因接管产生一次以上 ACME 调用
++- **Pass Condition**: 编排/恢复测试断言接管后 ACME 恰好调用一次并正常落定；恢复路径与请求路径共用同一 singleflight 入口
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-7: alreadyRevoked 按成功收敛且不再调用 CA
++- **Type**: `rule`
++- **Given**: ACME 返回 ProblemDetails 类型 alreadyRevoked
++- **When**: 吊销流程处理响应
++- **Then**: 尝试落定 succeeded，本地 isRevoked 收敛为 true，之后不再调用 ACME
++- **Pass Condition**: 分类单元测试覆盖 alreadyRevoked → 成功；编排测试断言本地收敛且无第二次 ACME 调用
++- **Evidence**: 单元测试输出、代码审查
++
++### AC-8: 吊销状态、列表、统计、工作流跳过来自同一持久结果
++- **Type**: `rule`
++- **Given**: 各类尝试终态
++- **When**: 检查证书列表、统计 SQL、工作流 checkCanSkip 与吊销状态转换
++- **Then**: isRevoked 仅由 succeeded 尝试的收敛动作置位；unknown/failed 期间为 false；统计与工作流跳过逻辑无需改判即与吊销状态一致；列表展示的已吊销/未知状态可回溯到尝试记录
++- **Pass Condition**: 全局搜索确认除收敛逻辑外无其他位置写 isRevoked；统计/工作流仍只读该字段；前端未知标识来自尝试记录
++- **Evidence**: 代码审查、grep 证据
++
++### AC-9: 未知状态客户端可见、可诊断并可显式重新确认
++- **Type**: `rule`
++- **Given**: 证书最近尝试为 unknown
++- **When**: 管理员查看证书列表/详情并操作
++- **Then**: 列表与详情展示"吊销结果未知"标识及时间/原因提示；存在显式"重新确认吊销"操作，确认后带 confirm=true 请求；明确失败时普通"吊销证书"入口仍可用
++- **Pass Condition**: 前端代码实现上述展示与交互，且 `npm run build` 通过；中英文案齐备
++- **Evidence**: 前端代码审查、构建输出
++
++### AC-10: 既有功能兼容
++- **Type**: `rule`
++- **Given**: 未吊销证书下载、已吊销证书再次吊销、非本系统签发证书吊销、普通证书申请与无需吊销的工作流
++- **When**: 分别操作
++- **Then**: 下载行为不变；已吊销/非本系统签发仍返回既有拒绝文案；申请与工作流链路无回归
++- **Pass Condition**: 既有校验与错误文案保持；改造范围外代码无行为变更；全量 go build/test 与前端构建通过
++- **Evidence**: 代码审查、构建与测试输出
++
++### AC-11: 迁移可升级、服务可启动并完成恢复
++- **Type**: `rule`
++- **Given**: 已存在部署的数据库与全新数据库
++- **When**: 执行新版本迁移并启动服务
++- **Then**: `certificate_revocation` 集合及全部字段、索引被创建；服务正常启动并执行一次启动恢复扫描，无 panic
++- **Pass Condition**: 迁移文件符合现有迁移规范（版本号递增、down 返回 ErrUnsupported）；编译通过；启动恢复对空集合无副作用
++- **Evidence**: 迁移代码审查、go build 输出
++
++### AC-12: 状态机与错误分类的保守完备性
++- **Type**: `rubric`
++- **Dimension**: 状态机覆盖度与"宁可未知、不可盲发"的保守性
++- **Scale**: 1-5
++- **Anchors**: 1 = 存在未分类错误可导致再次盲发或状态悬空；3 = 主要分支覆盖但有个别边界依赖默认行为；5 = 全部错误形态与遗留/并发/删除边界均有确定归宿，默认归宿为 unknown，无任何盲重发路径
++- **Pass Threshold**: >= 4
++- **Evidence**: 单元测试用例矩阵、代码审查
++
++### AC-13: 分层一致性与诊断信息质量
++- **Type**: `rubric`
++- **Dimension**: 与现有 repository/service/handler/前端分层风格的一致性及日志/诊断字段的可用性
++- **Scale**: 1-5
++- **Anchors**: 1 = 分层混乱、无诊断信息；3 = 基本可用但风格不一或诊断不足；5 = 严格沿用现有模式，尝试记录字段足以支撑排障（所有者/阶段/心跳/错误/时间线）
++- **Pass Threshold**: >= 4
++- **Evidence**: 代码审查
++
++## Open Questions
++- 无（关键决策已按需求与代码现状确定：新集合承载尝试、isRevoked 为唯一收敛结果、alreadyRevoked 视为成功、unknown 需 confirm=true）。
+diff --git a/.trae/specs/cert-revocation-attempt/tasks.md b/.trae/specs/cert-revocation-attempt/tasks.md
+new file mode 100644
+index 00000000..27b3a428
+--- /dev/null
++++ b/.trae/specs/cert-revocation-attempt/tasks.md
+@@ -0,0 +1,141 @@
++# 证书吊销去重与结果收敛 - 实施计划
++
++## Task 1: 新建吊销尝试集合（迁移、领域模型、仓储）
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 新增版本化迁移 `migrations/1791849600_upgrade_v0.4.36.go`（down 返回 `errors.ErrUnsupported`，风格对齐现有迁移）：用 `core.NewBaseCollection("certificate_revocation")` 创建集合，字段：
++    - `certificateRef` text（required）、`status` text（required）、`stage` text、`owner` text、`heartbeat` date、`converged` bool、`errorType` text、`errorStatusCode` number、`errorMessage` text、`startedAt` date、`endedAt` date；
++    - 索引：`certificateRef` 普通索引（供"查最近尝试"与恢复扫描使用）。
++  - 新增 `internal/domain/certificate_revocation.go`：常量 `CollectionNameCertificateRevocation="certificate_revocation"`；模型 `CertificateRevocation{Meta; CertificateRef; Status; Stage; Owner; Heartbeat time.Time; Converged bool; ErrorType string; ErrorStatusCode int; ErrorMessage string; StartedAt, EndedAt time.Time}`；状态常量 `processing/succeeded/failed/unknown`、阶段常量 `prepared/calling`。
++  - 新增 `internal/repository/certificate_revocation.go`：
++    - `Save`（upsert，模式对齐 CertificateRepository，含 record→model 映射）；
++    - `GetLatestByCertificateId`（按 -created 取第一条，无记录返回 `domain.ErrRecordNotFound`）；
++    - `ListProcessing`（status=processing 全部记录，启动恢复用）；
++    - `CreateProcessingIfAbsent`：在 `RunInTransaction` 内先查同证书是否已有 processing 记录，存在则返回该记录与 `false`，不存在则插入新 processing/prepared 记录并返回 `true`（跨进程兜底）。
++- **Acceptance Criteria Addressed**: AC-1, AC-8, AC-11, AC-13
++- **Test Requirements**:
++  - `rule` TR-1.1: 迁移文件中集合名、全部字段名/类型、索引与领域模型/repository 读写键完全一致；`go build ./...` 通过。证据：编译输出与代码对照。
++  - `rule` TR-1.2: 仓储层不包含任何 ACME/网络调用；`Save` 对空 Id 新建、非空 Id 更新的分支与现有仓储一致。证据：代码审查。
++- **Notes**: 集合默认 API 规则（仅 superuser 可读写）即可，前端以 superuser 访问只读。
++- **Completion Evidence**:
++  - 新增 [1791849600_upgrade_v0.4.36.go](file:///f:/swe/098833/project-02/migrations/1791849600_upgrade_v0.4.36.go)：幂等创建 `certificate_revocation`（11 个业务字段 + certificateRef/status 两个索引，down 返回 ErrUnsupported）。
++  - 新增 [certificate_revocation.go 领域模型](file:///f:/swe/098833/project-02/internal/domain/certificate_revocation.go) 与 [仓储](file:///f:/swe/098833/project-02/internal/repository/certificate_revocation.go)（GetLatestByCertificateId/ListProcessing/ListUnconverged/CreateProcessingIfAbsent/Save）。
++  - TR-1.1/1.2：字段键名三处一致；仓储无任何 ACME/网络引用，Save 沿用证书仓储 upsert 模式；gopls 对全部相关文件诊断为 0。
++
++## Task 2: 吊销结果分类器（纯函数 + 单元测试）
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 新增 `internal/certificate/revoke_classifier.go`：定义结果类别（succeeded/failed/unknown）与可诊断结构（errorType、statusCode、message）；实现
++    `classifyRevokeError(err error) revokeOutcome`：
++    - nil → succeeded；
++    - `errors.As(err, &problem)` 命中 `*acme.ProblemDetails`：Type==alreadyRevoked → succeeded；HTTPStatus 为 4xx → failed；其余（5xx/0 等）→ unknown；
++    - `errors.Is(context.DeadlineExceeded/Canceled)`、其余一切错误（网络/EOF/TLS/url.Error/未知）→ unknown（保守默认）。
++  - 新增 `internal/certificate/revoke_classifier_test.go`：用表驱动覆盖 nil、alreadyRevoked(200/400 包裹)、典型 4xx（unauthorized/badRevocationReason）、5xx serverInternal、deadline、canceled、伪造网络错误、nil 包裹错误。
++- **Acceptance Criteria Addressed**: AC-3, AC-4, AC-7, AC-12
++- **Test Requirements**:
++  - `rule` TR-2.1: `go test ./internal/certificate/ -run Revoke -v` 全部用例通过；4xx→failed、5xx/超时/网络/未知→unknown、alreadyRevoked→succeeded 均有断言。证据：测试输出。
++  - `rubric` TR-2.2: 分类保守性；1-5；1=存在落入成功/失败的歧义错误，3=主干覆盖，5=任何非明确结果均落 unknown 且有测试锁定；阈值>=4。证据：用例矩阵与代码审查。
++- **Completion Evidence**:
++  - 新增 [revoke_classifier.go](file:///f:/swe/098833/project-02/internal/certificate/revoke_classifier.go) 与 [revoke_classifier_test.go](file:///f:/swe/098833/project-02/internal/certificate/revoke_classifier_test.go)。
++  - 表驱动用例 15 个：nil、alreadyRevoked（含 wrap）、4xx（403/400）、5xx、零状态码、DeadlineExceeded/Canceled（含 wrap）、net.Error、EOF、未知错误；另覆盖 classifyLocalError。
++  - TR-2.2 自评 5/5：非 nil 且非 alreadyRevoked/4xx 的一切错误（含 5xx/0）默认 unknown，保守性由测试锁定；gopls 诊断 0。测试命令因执行环境 shell 故障（0xC0000142）未能运行，以类型检查与逐行走查替代，留待独立审查复跑。
++
++## Task 3: 吊销编排服务（持久尝试、singleflight、收敛、恢复）
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 1, Task 2
++- **Description**:
++  - 在 `internal/certificate` 包新增 `revocation.go`（或在 service.go 内改造）实现编排，重写 `RevokeCertificate`：
++    - 进程所有者 ID：包级 `sync.Once` 生成 `hostname-pid-random`；
++    - singleflight（按 certificateId 键）：并发请求共享同一执行并返回同一结果；
++    - ACME 执行器抽为接口（默认实现：账户查询→客户端构造→`RevokeCertificate`，沿用现有错误包装），便于注入 fake；调用前的本地错误归类 failed；
++    - 主流程（在 singleflight 内）：
++      1. 复用现有校验（非本系统签发拒绝；isRevoked=true 时保持既有"已吊销"拒绝——但若存在 succeeded 未收敛记录则先收敛）；
++      2. 读最近尝试并决策：
++         - succeeded：幂等执行本地收敛（无 ACME）后返回成功；
++         - failed：经事务创建新 processing/prepared 记录后执行；
++         - unknown：`confirm!=true` 返回 `domain.NewError(409, ...)`（含诊断消息），不调用 ACME；`confirm=true` 才建新尝试执行；
++         - processing 遗留：owner 非本进程或心跳超时（常量 2 分钟）时，prepared → 接管（改 owner/心跳）执行；calling → 置 unknown 返回 409；owner 为本进程且心跳新鲜（理论不可达）保守按 unknown；
++         - 无记录：事务创建 processing/prepared 后执行；
++      3. 执行：先持久化 stage=calling + heartbeat（脱离 HTTP 的后台 context，固定 60s 超时），再调用 ACME；
++      4. 按分类器落定：succeeded（alreadyRevoked 同）→ 置证书 isRevoked=true 并 Save、尝试 converged=true（证书 not found 视为已收敛）；failed/unknown 写诊断字段与 endedAt；
++      5. 证书 Save 失败时保持 succeeded/converged=false，本次返回错误但不改变终态（后续请求/启动恢复只收敛本地）。
++    - `RecoverInterrupted(ctx)`：ListProcessing → prepared 经同一 singleflight 入口在后台 goroutine 接管；calling 置 unknown（诊断 "interrupted before response"）；另扫描 succeeded 且 converged=false 的尝试做本地收敛（通过 GetLatestByCertificateId 配合逐证书处理，或仓储增加查询方法）。
++  - 更新 `service_deps.go` 增加尝试仓储与 ACME 执行器依赖接口；构造函数 `NewCertificateService` 注入默认实现（保持 routes/scheduler 调用兼容，可用可选参数或在构造函数内默认装配）。
++  - 新增 `internal/certificate/revocation_test.go`：以 fake 证书仓储、fake 尝试仓储（内存实现接口）、fake ACME 执行器（可注入错误、可计数、可制造 Save 首次失败）覆盖：
++    持久化先于调用、并发只调用一次、4xx failed 后重新发起产生第二条尝试、unknown 阻断+confirm 开启新尝试、成功后 Save 失败仅收敛不再次调用、prepared 接管只调用一次、alreadyRevoked 收敛、succeeded 证书 not-found 视为收敛。
++- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-3, AC-4, AC-5, AC-6, AC-7, AC-8, AC-12, AC-13
++- **Test Requirements**:
++  - `rule` TR-3.1: `go test ./internal/certificate/ -v` 通过，且各编排场景断言满足 AC 描述（ACME 调用次数、尝试记录条数与终态、isRevoked 归宿、409 行为）。证据：测试输出。
++  - `rule` TR-3.2: 除收敛动作外，包内不存在其他对 `IsRevoked=true` 的写入；singleflight key 为 certificateId，恢复与请求共用同一入口函数。证据：grep 与代码审查。
++  - `rubric` TR-3.3: 状态机/恢复可维护性；1-5；1=分支混杂难测，3=主流程可用，5=编排与 IO 边界清晰、全部终态有日志与持久归宿；阈值>=4。证据：代码审查。
++- **Notes**: 保持对已吊销证书、非本系统签发证书的既有错误文案；响应 data 返回尝试 id/status 供可观测。
++- **Completion Evidence**:
++  - 新增 [revocation.go](file:///f:/swe/098833/project-02/internal/certificate/revocation.go)（owner、singleflight、Prepare/Do 两阶段、状态机、收敛、RecoverInterrupted）；改造 [service.go](file:///f:/swe/098833/project-02/internal/certificate/service.go) 与 [service_deps.go](file:///f:/swe/098833/project-02/internal/certificate/service_deps.go)；ACME 真实执行器在调用前拆分账户/客户端准备（revokeLocalError）与网络调用。
++  - 新增 [revocation_test.go](file:///f:/swe/098833/project-02/internal/certificate/revocation_test.go)：15 个测试函数（16 场景）——先持久化后调用（CA 调用时断言 processing/calling）、5 并发只调用一次、4xx failed 后普通入口产生第二条尝试、unknown 阻断（无 confirm 不增加调用）+confirm 后新尝试、CA 成功但本地 Save 首败后仅收敛不再调用、prepared 遗留安全接管（复用同一记录）、calling 遗留置 unknown 零调用、alreadyRevoked 收敛且再次吊销回到既有拒绝、succeeded 记录证书被删除视为收敛、非本系统签发/遗产已吊销拒绝、本地准备错误 failed 可重试、启动恢复混合场景（prepared 接管 1 次调用 + calling→unknown + unconverged 收敛）。
++  - TR-3.2：grep 确认生产代码 `IsRevoked=true` 仅存在于 [revocation.go 收敛函数](file:///f:/swe/098833/project-02/internal/certificate/revocation.go#L341)；恢复与请求共用 `revokeFlights`。
++  - TR-3.3 自评 5/5：编排/IO 边界（invoker、repo 接口）清晰，全部终态持久化且有 slog 日志；gopls 诊断 0。测试执行受 shell 环境故障阻断，留待审查复跑。
++- **R1 审查加固（advisory F2/F4/F5/F6 已采纳，无 actionable 项）**:
++  - F4：singleflight 闭包内 defer recover 并转成普通错误（请求路径与恢复路径），杜绝 panic 毒化 certId key 导致后续吊销永久挂死。
++  - F2：processing 遗留对应证书已删除时落终态（prepared→failed/local、calling→unknown/interrupted），不再每次启动重复入队，且零 CA 调用；补 `TestProcessingAttemptForMissingCertificateIsClosed`（prepared/calling 两子用例）。
++  - F5：补 `TestRevokeAbortsWhenAttemptCannotBePersisted`（建记录失败零调用）与 `TestRevokeAbortsWhenCallingStagePersistFails`（calling 阶段落库失败零调用且留 processing/prepared 遗留供接管）。
++  - F6：更正后台上下文注释。F1（多实例 CAS，spec 明确 Non-Goal）与 F3（confirm 并发搭车，无重复 CA 风险）不改。
++
++## Task 4: REST/DTO 接线与启动恢复注册
++- **Status**: `completed`
++- **Priority**: high
++- **Depends On**: Task 3
++- **Description**:
++  - `internal/domain/dtos/certificate.go`：`CertificateRevokeReq` 增加 `Confirm bool json:"confirm,omitempty"`；`CertificateRevokeResp` 增加 `AttemptId`、`Status` 字段。
++  - `internal/rest/handlers/certificates.go`：透传 confirm；409 等错误仍经 `resp.Err`（body code 可被前端识别）。
++  - `internal/certificate/service.go` 的 `InitSchedule`：在现有清理定时任务之外调用一次 `RecoverInterrupted(context.Background())`（错误记日志不 panic），保证启动恢复随 scheduler.Setup 执行。
++  - 核对 routes/scheduler 两处 `NewCertificateService` 装配在改造后仍可编译运行。
++- **Acceptance Criteria Addressed**: AC-4, AC-6, AC-8, AC-10, AC-11
++- **Test Requirements**:
++  - `rule` TR-4.1: 请求体含/不含 confirm 时行为与 AC-4 一致；unknown 返回 body code=409 且消息非空；成功响应包含 attemptId/status。证据：代码审查 + 编排测试。
++  - `rule` TR-4.2: 启动路径调用一次恢复且空集合/空表无错误无 panic；`go build ./...` 通过。证据：编译输出与代码审查。
++- **Completion Evidence**:
++  - [dtos/certificate.go](file:///f:/swe/098833/project-02/internal/domain/dtos/certificate.go) 已加 `Confirm` 与响应 `AttemptId/Status`；[handler](file:///f:/swe/098833/project-02/internal/rest/handlers/certificates.go#L49-L62) 经 `e.BindBody(req)` 自动透传 confirm，错误统一走 `resp.Err`（unknown 为 body code 409），无需改动。
++  - [service.go `InitSchedule`](file:///f:/swe/098833/project-02/internal/certificate/service.go#L43-L55) 在注册清理任务后调用一次 `RecoverInterrupted`，错误仅记日志不阻断服务。
++  - routes/scheduler 两处 `NewCertificateService(acmeAccountRepo, certificateRepo)` 签名保持不变；gopls 对 handler/routes/scheduler 诊断 0。
++
++## Task 5: 前端未知状态展示与显式重新确认
++- **Status**: `completed`
++- **Priority**: medium
++- **Depends On**: Task 4
++- **Description**:
++  - `ui/src/domain/certificate.ts`：增加吊销尝试类型与状态常量（unknown/failed/succeeded/processing）。
++  - 新增 `ui/src/repository/certificateRevocation.ts`：按当前页证书 id 批量查询最近尝试（filter 以 OR 拼接 certificateRef，getFullList，requestKey:null），并在 `_pocketbase.ts` 增加集合名常量。
++  - `ui/src/api/certificates.ts`：`revoke(certificateId, confirm?)` 透传 body。
++  - `ui/src/pages/certificates/CertificateList.tsx`：列表加载后拉取尝试映射；有效期列/操作区为 unknown 展示"吊销结果未知"标签与 Tooltip（时间、errorMessage）；unknown 时菜单项变为"重新确认吊销"，弹窗明确提示远端结果可能已吊销、需显式确认，确认后以 confirm=true 调用并刷新；failed 时普通吊销入口保持可用；成功后本地乐观更新与刷新逻辑保留。
++  - `ui/src/components/certificate/CertificateDetail.tsx`：unknown 时展示对应 Tag 与诊断 Tooltip。
++  - 中英文案：`ui/src/i18n/resources/zh/nls.certificate.json` 与 `en/nls.certificate.json` 增加未知标签、Tooltip 字段、重新确认菜单/弹窗文案。
++- **Acceptance Criteria Addressed**: AC-8, AC-9
++- **Test Requirements**:
++  - `rule` TR-5.1: unknown 证书在列表与详情均可见标识与诊断，重新确认请求体含 confirm=true；failed/isRevoked 菜单项可用性符合需求。证据：前端代码审查 + `npm run build` 输出。
++  - `rubric` TR-5.2: 交互清晰性；1-5；1=未知无提示或易误触盲发，3=有提示但确认意图不突出，5=未知/失败/成功三态清晰、重新确认具备二次确认与风险说明；阈值>=4。证据：代码审查。
++- **Completion Evidence**:
++  - 新增 [certificateRevocation.ts 仓储](file:///f:/swe/098833/project-02/ui/src/repository/certificateRevocation.ts)（按证书 id 批量拉取并归约为每证书最新尝试）；[_pocketbase.ts](file:///f:/swe/098833/project-02/ui/src/repository/_pocketbase.ts) 增集合常量；[domain/certificate.ts](file:///f:/swe/098833/project-02/ui/src/domain/certificate.ts) 增尝试模型与状态常量；[api/certificates.ts](file:///f:/swe/098833/project-02/ui/src/api/certificates.ts) revoke 透传 confirm。
++  - [CertificateList.tsx](file:///f:/swe/098833/project-02/ui/src/pages/certificates/CertificateList.tsx)：列表数据后拉取尝试映射；有效期列 unknown 显示 warning 标识与含时间/原因的 Tooltip；菜单在 unknown 时切换为"重新确认吊销"，弹窗明确提示远端可能已吊销并需显式确认（confirm=true）；409 响应以 warning 通知展示并刷新列表；failed/isRevoked 菜单语义保持。
++  - [CertificateDetail.tsx](file:///f:/swe/098833/project-02/ui/src/components/certificate/CertificateDetail.tsx)：unknown 时展示 warning Tag + 诊断 Tooltip；已吊销红色 Tag 不变。
++  - 中英文案已加（[zh](file:///f:/swe/098833/project-02/ui/src/i18n/resources/zh/nls.certificate.json) / [en](file:///f:/swe/098833/project-02/ui/src/i18n/resources/en/nls.certificate.json)）。
++  - TR-5.2 自评 5/5：unknown（warning + 风险说明 + 二次确认）、failed（普通入口直接重试）、succeeded（已吊销态 + 既有拒绝）三态清晰；TS 语言服务对全部前端改动文件诊断 0。`npm run build` 待 shell 恢复后复跑。
++
++## Task 6: 全量验证与回归确认
++- **Status**: `blocked`
++- **Priority**: medium
++- **Blocked By**: 当前执行环境 Shell 无法启动任何外部进程（任何命令均返回退出码 3221225794 / 0xC0000142，含 `go version` 这类基础命令），`go build/vet/test` 与 `npm run build` 均无法执行。已用 gopls 与 TypeScript 语言服务对全部改动文件做语义诊断，结果均为 0 诊断。
++- **Unblock Condition**: Shell 环境恢复（`go version` 可执行）后，依次运行 `go build ./...`、`go vet ./...`、`go test ./...`、`ui` 目录 `npm run build`，并核对改动文件清单。
++- **Depends On**: Task 1, Task 2, Task 3, Task 4, Task 5
++- **Description**:
++  - 后端执行 `go build ./...`、`go vet ./...`、`go test ./...`；
++  - 前端在 `ui/` 执行 `npm run build`；
++  - 逐项核对 AC-1~AC-11 的证据，记录到 Completion Evidence；确认下载、已吊销拒绝、申请/工作流链路零改动回归。
++- **Acceptance Criteria Addressed**: AC-10, AC-11
++- **Test Requirements**:
++  - `rule` TR-6.1: 上述命令全部成功（无编译/ vet /测试/构建失败）。证据：命令输出。
++  - `rule` TR-6.2: `git` 工作区改动文件清单仅涉及需求相关文件（迁移、domain、repository、certificate 服务、dtos/handler、前端证书相关文件与 i18n），无关文件无改动。证据：改动清单审查。
+diff --git a/internal/certificate/revocation.go b/internal/certificate/revocation.go
+new file mode 100644
+index 00000000..f2913a14
+--- /dev/null
++++ b/internal/certificate/revocation.go
+@@ -0,0 +1,499 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"log/slog"
++	"os"
++	"sync"
++	"time"
++
++	"github.com/certimate-go/certimate/internal/certacme"
++	"github.com/certimate-go/certimate/internal/domain"
++	"github.com/certimate-go/certimate/internal/domain/dtos"
++	"github.com/pocketbase/pocketbase/tools/security"
++)
++
++const (
++	// revokeCallTimeout bounds the detached ACME revocation call. A timeout is
++	// persisted as an unknown outcome rather than retried blindly.
++	revokeCallTimeout = 60 * time.Second
++	// revokeOwnerHeartbeatStaleness decides whether a processing attempt owned
++	// by the current instance is still alive.
++	revokeOwnerHeartbeatStaleness = 2 * time.Minute
++)
++
++// revokeCall is the prepared, single-use revocation request. It performs the
++// actual CA call; implementations must not do account/client preparation here.
++type revokeCall func(ctx context.Context) error
++
++// revokeInvoker separates the pre-call local preparation (which is safe to
++// retry) from the actual CA call (which must never be sent twice blindly).
++type revokeInvoker interface {
++	// Prepare resolves the ACME account and client without contacting the
++	// revocation endpoint. The returned revokeCall performs the endpoint call.
++	Prepare(ctx context.Context, certificate *domain.Certificate) (revokeCall, error)
++}
++
++// revokeLocalError marks an error that occurred before the CA was contacted.
++type revokeLocalError struct {
++	err error
++}
++
++func (e *revokeLocalError) Error() string {
++	return e.err.Error()
++}
++
++func (e *revokeLocalError) Unwrap() error {
++	return e.err
++}
++
++// acmeRevokeInvoker is the production revokeInvoker.
++type acmeRevokeInvoker struct {
++	acmeAccountRepo acmeAccountRepository
++}
++
++func newACMERevokeInvoker(acmeAccountRepo acmeAccountRepository) *acmeRevokeInvoker {
++	return &acmeRevokeInvoker{acmeAccountRepo: acmeAccountRepo}
++}
++
++func (i *acmeRevokeInvoker) Prepare(ctx context.Context, certificate *domain.Certificate) (revokeCall, error) {
++	acmeAccount, err := i.acmeAccountRepo.GetByCAAndAcctUrl(ctx, certificate.CA, certificate.ACMEAccountUrl)
++	if err != nil {
++		return nil, &revokeLocalError{err: fmt.Errorf("could not find acme account: %w", err)}
++	}
++
++	acmeClient, err := certacme.NewACMEClientWithAccount(acmeAccount)
++	if err != nil {
++		return nil, &revokeLocalError{err: fmt.Errorf("could not initialize acme config: %w", err)}
++	}
++
++	return func(callCtx context.Context) error {
++		_, err := acmeClient.RevokeCertificate(callCtx, &certacme.RevokeCertificateRequest{
++			Certificate: certificate.Certificate,
++		})
++		return err
++	}, nil
++}
++
++var (
++	ownerMu      sync.Mutex
++	ownerIDValue string
++)
++
++// currentOwnerID returns the process-unique owner identifier persisted on
++// revocation attempts.
++func currentOwnerID() string {
++	ownerMu.Lock()
++	defer ownerMu.Unlock()
++
++	if ownerIDValue == "" {
++		hostname, _ := os.Hostname()
++		ownerIDValue = fmt.Sprintf("%s#%d#%s", hostname, os.Getpid(), security.PseudorandomString(8))
++	}
++	return ownerIDValue
++}
++
++// setOwnerIDForTest overrides the owner identifier; tests only.
++func setOwnerIDForTest(id string) {
++	ownerMu.Lock()
++	defer ownerMu.Unlock()
++	ownerIDValue = id
++}
++
++// RevokeCertificate runs the persisted, de-duplicated revocation workflow.
++// Concurrent requests for the same certificate share one attempt and observe
++// the same terminal result. The ACME call runs on a context detached from the
++// HTTP request so that client disconnects cannot abort an in-flight attempt
++// without persisting its outcome.
++func (s *CertificateService) RevokeCertificate(ctx context.Context, req *dtos.CertificateRevokeReq) (*dtos.CertificateRevokeResp, error) {
++	if req == nil || req.CertificateId == "" {
++		return nil, domain.ErrInvalidParams
++	}
++	// The CA call is detached from the HTTP request lifetime: a client page
++	// closing or timing out must not abort an in-flight attempt before its
++	// outcome can be persisted. The detached call itself is bounded by
++	// revokeCallTimeout.
++	bgCtx := context.WithoutCancel(ctx)
++
++	v, err, _ := s.revokeFlights.Do(req.CertificateId, func() (ret any, retErr error) {
++		// convert a panic into a regular error: waiters share one ordinary
++		// failure instead of re-panicking, and the singleflight key completes
++		// its normal lifecycle
++		defer func() {
++			if r := recover(); r != nil {
++				slog.Default().Error("panic while revoking certificate",
++					slog.String("certificateId", req.CertificateId), slog.Any("recover", r))
++				retErr = fmt.Errorf("certificate revocation panicked: %v", r)
++			}
++		}()
++		return s.runRevocation(bgCtx, req.CertificateId, req.Confirm)
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	resp, _ := v.(*dtos.CertificateRevokeResp)
++	return resp, nil
++}
++
++func (s *CertificateService) runRevocation(ctx context.Context, certificateId string, confirm bool) (*dtos.CertificateRevokeResp, error) {
++	attempt, err := s.revocationRepo.GetLatestByCertificateId(ctx, certificateId)
++	if err != nil && !domain.IsRecordNotFoundError(err) {
++		return nil, err
++	}
++
++	certificate, err := s.certificateRepo.GetById(ctx, certificateId)
++	if err != nil {
++		// a certificate deleted after the CA succeeded is treated as converged
++		if domain.IsRecordNotFoundError(err) && attempt != nil &&
++			attempt.Status == domain.CertificateRevocationStatusTypeSucceeded.String() && !attempt.Converged {
++			if convErr := s.markAttemptConverged(ctx, attempt); convErr != nil {
++				return nil, convErr
++			}
++			return buildRevokeResp(attempt), nil
++		}
++		// a processing attempt whose certificate no longer exists must be
++		// closed, otherwise startup recovery would enqueue it forever
++		if domain.IsRecordNotFoundError(err) && attempt != nil &&
++			attempt.Status == domain.CertificateRevocationStatusTypeProcessing.String() {
++			s.closeProcessingAttemptForMissingCertificate(ctx, attempt)
++		}
++		return nil, err
++	}
++
++	if certificate.ACMEAccountUrl == "" || certificate.ACMECertificateUrl == "" {
++		return nil, fmt.Errorf("could not revoke a certificate which is not issued in Certimate")
++	}
++
++	// A succeeded attempt is authoritative: if local convergence has not yet
++	// been completed, finish it locally without ever contacting the CA again.
++	if attempt != nil && attempt.Status == domain.CertificateRevocationStatusTypeSucceeded.String() {
++		if !attempt.Converged {
++			if err := s.convergeRevokedCertificate(ctx, certificate, attempt); err != nil {
++				return nil, err
++			}
++			return buildRevokeResp(attempt), nil
++		}
++		// fully converged: fall through to the existing "already revoked"
++		// rejection semantics below
++	}
++
++	if certificate.IsRevoked {
++		return nil, fmt.Errorf("could not revoke a certificate which is already revoked")
++	}
++
++	if attempt != nil {
++		switch attempt.Status {
++		case domain.CertificateRevocationStatusTypeProcessing.String():
++			return s.handleProcessingAttempt(ctx, certificate, attempt)
++
++		case domain.CertificateRevocationStatusTypeFailed.String():
++			// definitive rejection: the regular entry point starts a new attempt
++			return s.startNewAttempt(ctx, certificate)
++
++		case domain.CertificateRevocationStatusTypeUnknown.String():
++			if !confirm {
++				return nil, buildUnknownOutcomeError(attempt)
++			}
++			return s.startNewAttempt(ctx, certificate)
++		}
++	}
++
++	return s.startNewAttempt(ctx, certificate)
++}
++
++// handleProcessingAttempt decides what to do with an in-flight attempt
++// discovered at the start of the workflow.
++func (s *CertificateService) handleProcessingAttempt(ctx context.Context, certificate *domain.Certificate, attempt *domain.CertificateRevocation) (*dtos.CertificateRevokeResp, error) {
++	heartbeatFresh := attempt.Owner == currentOwnerID() && time.Since(attempt.Heartbeat) < revokeOwnerHeartbeatStaleness
++	if heartbeatFresh {
++		// Same live owner inside the singleflight flight is unreachable in
++		// normal operation; stay conservative and never send a second request.
++		return nil, fmt.Errorf("a revocation request for this certificate is already in progress")
++	}
++
++	switch attempt.Stage {
++	case domain.CertificateRevocationStageTypePrepared.String():
++		// owner exited before the CA was ever contacted: safe to take over
++		slog.Default().Info("take over an interrupted revocation attempt before the CA was called",
++			slog.String("certificateId", certificate.Id), slog.String("attemptId", attempt.Id), slog.String("previousOwner", attempt.Owner))
++		attempt.Owner = currentOwnerID()
++		attempt.Heartbeat = time.Now()
++		if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++			return nil, err
++		}
++		return s.executeAttempt(ctx, certificate, attempt)
++
++	default: // stage=calling or anything unexpected: remote result is unknown
++		markAttemptUnknown(attempt, revokeErrorTypeInterrupted, 0,
++			"the previous owner was interrupted while the revocation request was in flight; the remote result is unknown")
++		if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++			return nil, err
++		}
++		return nil, buildUnknownOutcomeError(attempt)
++	}
++}
++
++func (s *CertificateService) startNewAttempt(ctx context.Context, certificate *domain.Certificate) (*dtos.CertificateRevokeResp, error) {
++	now := time.Now()
++	attempt := &domain.CertificateRevocation{
++		CertificateRef: certificate.Id,
++		Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++		Stage:          domain.CertificateRevocationStageTypePrepared.String(),
++		Owner:          currentOwnerID(),
++		Heartbeat:      now,
++		StartedAt:      now,
++	}
++
++	persisted, created, err := s.revocationRepo.CreateProcessingIfAbsent(ctx, attempt)
++	if err != nil {
++		return nil, err
++	}
++	if !created {
++		// a processing attempt appeared concurrently; observe/take it over
++		return s.handleProcessingAttempt(ctx, certificate, persisted)
++	}
++
++	return s.executeAttempt(ctx, certificate, persisted)
++}
++
++// executeAttempt performs the actual revocation for an already-persisted
++// processing attempt. The attempt record exists and is in stage=prepared when
++// this is entered; nothing calls the CA before this persistence.
++func (s *CertificateService) executeAttempt(ctx context.Context, certificate *domain.Certificate, attempt *domain.CertificateRevocation) (*dtos.CertificateRevokeResp, error) {
++	call, err := s.revokeInvoker.Prepare(ctx, certificate)
++	if err != nil {
++		var localErr *revokeLocalError
++		if !errors.As(err, &localErr) {
++			err = &revokeLocalError{err: err}
++		}
++		return s.finishAttempt(ctx, certificate, attempt, classifyLocalError(err))
++	}
++
++	// mark that we are about to contact the CA; if this cannot be persisted we
++	// must not call the CA (a restart could no longer prove the call was missed)
++	attempt.Stage = domain.CertificateRevocationStageTypeCalling.String()
++	attempt.Heartbeat = time.Now()
++	if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++		return nil, err
++	}
++
++	callCtx, cancel := context.WithTimeout(ctx, revokeCallTimeout)
++	defer cancel()
++
++	callErr := call(callCtx)
++	return s.finishAttempt(ctx, certificate, attempt, classifyRevokeError(callErr))
++}
++
++func (s *CertificateService) finishAttempt(ctx context.Context, certificate *domain.Certificate, attempt *domain.CertificateRevocation, result revokeErrorResult) (*dtos.CertificateRevokeResp, error) {
++	now := time.Now()
++	attempt.EndedAt = now
++	attempt.Heartbeat = now
++	attempt.ErrorType = result.errorType
++	attempt.ErrorStatusCode = result.statusCode
++	attempt.ErrorMessage = result.message
++
++	switch result.outcome {
++	case revokeOutcomeSucceeded:
++		attempt.Status = domain.CertificateRevocationStatusTypeSucceeded.String()
++		attempt.Converged = false
++		if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++			// the CA was already revoked successfully; surface the error so a
++			// follow-up request/startup recovery converges locally without a
++			// second CA call
++			return nil, fmt.Errorf("failed to persist the succeeded revocation attempt: %w", err)
++		}
++
++		if err := s.convergeRevokedCertificate(ctx, certificate, attempt); err != nil {
++			return nil, fmt.Errorf("the CA revoked the certificate but the local state could not be saved: %w", err)
++		}
++
++		return buildRevokeResp(attempt), nil
++
++	case revokeOutcomeFailed:
++		attempt.Status = domain.CertificateRevocationStatusTypeFailed.String()
++		if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++			return nil, err
++		}
++		slog.Default().Warn("certificate revocation was rejected by the CA",
++			slog.String("certificateId", certificate.Id), slog.String("errorType", result.errorType), slog.Int("statusCode", result.statusCode))
++		return nil, fmt.Errorf("failed to revoke certificate: %s", result.message)
++
++	default: // unknown
++		attempt.Status = domain.CertificateRevocationStatusTypeUnknown.String()
++		if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++			return nil, err
++		}
++		slog.Default().Warn("certificate revocation result is unknown",
++			slog.String("certificateId", certificate.Id), slog.String("errorType", result.errorType), slog.String("message", result.message))
++		return nil, buildUnknownOutcomeError(attempt)
++	}
++}
++
++// convergeRevokedCertificate flips certificate.isRevoked to true based solely
++// on a succeeded revocation attempt. It never calls the CA. A certificate that
++// has been deleted meanwhile is treated as already converged.
++func (s *CertificateService) convergeRevokedCertificate(ctx context.Context, certificate *domain.Certificate, attempt *domain.CertificateRevocation) error {
++	if attempt.Converged {
++		return nil
++	}
++
++	latest := certificate
++	if latest == nil || latest.Id != attempt.CertificateRef {
++		c, err := s.certificateRepo.GetById(ctx, attempt.CertificateRef)
++		if err != nil {
++			if domain.IsRecordNotFoundError(err) {
++				return s.markAttemptConverged(ctx, attempt)
++			}
++			return err
++		}
++		latest = c
++	}
++
++	if !latest.IsRevoked {
++		latest.IsRevoked = true
++		if _, err := s.certificateRepo.Save(ctx, latest); err != nil {
++			return err
++		}
++	}
++
++	return s.markAttemptConverged(ctx, attempt)
++}
++
++func (s *CertificateService) markAttemptConverged(ctx context.Context, attempt *domain.CertificateRevocation) error {
++	if attempt.Converged {
++		return nil
++	}
++	attempt.Converged = true
++	_, err := s.revocationRepo.Save(ctx, attempt)
++	return err
++}
++
++// RecoverInterrupted resolves revocation attempts left behind by a previous
++// process. It runs once on startup:
++//   - processing/calling -> unknown (the remote result cannot be proven);
++//   - processing/prepared -> taken over through the same singleflight entry
++//     point (the CA was never contacted);
++//   - succeeded but unconverged -> local convergence only.
++func (s *CertificateService) RecoverInterrupted(ctx context.Context) error {
++	processing, err := s.revocationRepo.ListProcessing(ctx)
++	if err != nil {
++		return fmt.Errorf("failed to list processing revocation attempts: %w", err)
++	}
++
++	certIdsToResume := make(map[string]struct{})
++	for _, attempt := range processing {
++		switch attempt.Stage {
++		case domain.CertificateRevocationStageTypePrepared.String():
++			certIdsToResume[attempt.CertificateRef] = struct{}{}
++
++		default:
++			// stage=calling or any unexpected stage: never resend blindly
++			markAttemptUnknown(attempt, revokeErrorTypeInterrupted, 0,
++				"the owner process exited while the revocation request was in flight; the remote result is unknown")
++			if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++				slog.Default().Error("failed to mark an interrupted revocation attempt as unknown",
++					slog.String("attemptId", attempt.Id), slog.Any("error", err))
++			} else {
++				slog.Default().Warn("marked an interrupted revocation attempt as unknown",
++					slog.String("certificateId", attempt.CertificateRef), slog.String("attemptId", attempt.Id))
++			}
++		}
++	}
++
++	unconverged, err := s.revocationRepo.ListUnconverged(ctx)
++	if err != nil {
++		slog.Default().Error("failed to list unconverged revocation attempts", slog.Any("error", err))
++	} else {
++		for _, attempt := range unconverged {
++			certIdsToResume[attempt.CertificateRef] = struct{}{}
++		}
++	}
++
++	for certId := range certIdsToResume {
++		certId := certId
++		go func() {
++			defer func() {
++				if r := recover(); r != nil {
++					slog.Default().Error("panic while recovering a revocation attempt",
++						slog.String("certificateId", certId), slog.Any("recover", r))
++				}
++			}()
++
++			_, _, _ = s.revokeFlights.Do(certId, func() (any, error) {
++				defer func() {
++					if r := recover(); r != nil {
++						slog.Default().Error("panic while recovering a revocation attempt",
++							slog.String("certificateId", certId), slog.Any("recover", r))
++					}
++				}()
++				return s.runRevocation(context.WithoutCancel(ctx), certId, false)
++			})
++		}()
++	}
++
++	if len(processing) > 0 || len(unconverged) > 0 {
++		slog.Default().Info("revocation attempt recovery scheduled",
++			slog.Int("processing", len(processing)), slog.Int("unconverged", len(unconverged)),
++			slog.Int("resumed", len(certIdsToResume)))
++	}
++
++	return nil
++}
++
++// closeProcessingAttemptForMissingCertificate puts a processing attempt whose
++// certificate record has been deleted into a terminal state, without ever
++// contacting the CA. A prepared attempt is closed as a definitive failure; a
++// calling attempt (which might have reached the CA) is closed as unknown.
++func (s *CertificateService) closeProcessingAttemptForMissingCertificate(ctx context.Context, attempt *domain.CertificateRevocation) {
++	now := time.Now()
++	message := "the certificate record no longer exists; the revocation attempt is closed without contacting the CA"
++	if attempt.Stage == domain.CertificateRevocationStageTypeCalling.String() {
++		attempt.Status = domain.CertificateRevocationStatusTypeUnknown.String()
++		attempt.ErrorType = revokeErrorTypeInterrupted
++	} else {
++		attempt.Status = domain.CertificateRevocationStatusTypeFailed.String()
++		attempt.ErrorType = revokeErrorTypeLocal
++	}
++	attempt.ErrorStatusCode = 0
++	attempt.ErrorMessage = message
++	attempt.Heartbeat = now
++	if attempt.StartedAt.IsZero() {
++		attempt.StartedAt = attempt.CreatedAt
++	}
++	attempt.EndedAt = now
++	if _, err := s.revocationRepo.Save(ctx, attempt); err != nil {
++		slog.Default().Error("failed to close a revocation attempt whose certificate is missing",
++			slog.String("attemptId", attempt.Id), slog.Any("error", err))
++	}
++}
++
++func markAttemptUnknown(attempt *domain.CertificateRevocation, errorType string, statusCode int, message string) {
++	now := time.Now()
++	attempt.Status = domain.CertificateRevocationStatusTypeUnknown.String()
++	attempt.ErrorType = errorType
++	attempt.ErrorStatusCode = statusCode
++	attempt.ErrorMessage = message
++	attempt.Heartbeat = now
++	if attempt.StartedAt.IsZero() {
++		attempt.StartedAt = attempt.CreatedAt
++	}
++	attempt.EndedAt = now
++}
++
++func buildRevokeResp(attempt *domain.CertificateRevocation) *dtos.CertificateRevokeResp {
++	return &dtos.CertificateRevokeResp{
++		AttemptId: attempt.Id,
++		Status:    attempt.Status,
++	}
++}
++
++func buildUnknownOutcomeError(attempt *domain.CertificateRevocation) error {
++	message := "the certificate revocation result is unknown due to a timeout or an interrupted request; the CA will not be contacted again until you explicitly confirm a new attempt"
++	if attempt.ErrorMessage != "" {
++		message = fmt.Sprintf("%s: %s", message, attempt.ErrorMessage)
++	}
++	return domain.NewError(409, message)
++}
+diff --git a/internal/certificate/revocation_test.go b/internal/certificate/revocation_test.go
+new file mode 100644
+index 00000000..429a7c0d
+--- /dev/null
++++ b/internal/certificate/revocation_test.go
+@@ -0,0 +1,901 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/pocketbase/dbx"
++
++	"github.com/go-acme/lego/v5/acme"
++
++	"github.com/certimate-go/certimate/internal/domain"
++	"github.com/certimate-go/certimate/internal/domain/dtos"
++)
++
++// ---------------- fakes ----------------
++
++type fakeCertRepo struct {
++	mu           sync.Mutex
++	certs        map[string]*domain.Certificate
++	saveFailures map[string]int // remaining forced failures by id
++	saveCount    map[string]int
++}
++
++func newFakeCertRepo() *fakeCertRepo {
++	return &fakeCertRepo{
++		certs:        map[string]*domain.Certificate{},
++		saveFailures: map[string]int{},
++		saveCount:    map[string]int{},
++	}
++}
++
++func cloneCert(c *domain.Certificate) *domain.Certificate {
++	v := *c
++	return &v
++}
++
++func (r *fakeCertRepo) seed(c *domain.Certificate) *domain.Certificate {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if c.Id == "" {
++		c.Id = "cert-1"
++	}
++	r.certs[c.Id] = cloneCert(c)
++	return r.certs[c.Id]
++}
++
++func (r *fakeCertRepo) GetById(ctx context.Context, id string) (*domain.Certificate, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	c, ok := r.certs[id]
++	if !ok {
++		return nil, domain.ErrRecordNotFound
++	}
++	return cloneCert(c), nil
++}
++
++func (r *fakeCertRepo) Save(ctx context.Context, c *domain.Certificate) (*domain.Certificate, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++
++	if c.Id == "" {
++		c.Id = fmt.Sprintf("cert-%d", len(r.certs)+1)
++	}
++	if r.saveFailures[c.Id] > 0 {
++		r.saveFailures[c.Id]--
++		r.saveCount[c.Id]++
++		return c, fmt.Errorf("simulated certificate save failure")
++	}
++	r.saveCount[c.Id]++
++	stored := cloneCert(c)
++	r.certs[c.Id] = stored
++	return cloneCert(stored), nil
++}
++
++func (r *fakeCertRepo) DeleteWithExprs(ctx context.Context, exprs ...dbx.Expression) (int, error) {
++	return 0, nil
++}
++
++func (r *fakeCertRepo) failNextSave(id string, times int) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.saveFailures[id] = times
++}
++
++func (r *fakeCertRepo) isRevoked(id string) bool {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	c, ok := r.certs[id]
++	return ok && c.IsRevoked
++}
++
++func (r *fakeCertRepo) delete(id string) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	delete(r.certs, id)
++}
++
++type fakeRevocationRepo struct {
++	mu           sync.Mutex
++	store        map[string]*domain.CertificateRevocation
++	seq          int
++	createErr    error // forced CreateProcessingIfAbsent failure
++	saveFailures int   // number of consecutive forced Save failures
++}
++
++func newFakeRevocationRepo() *fakeRevocationRepo {
++	return &fakeRevocationRepo{store: map[string]*domain.CertificateRevocation{}}
++}
++
++func cloneAttempt(a *domain.CertificateRevocation) *domain.CertificateRevocation {
++	v := *a
++	return &v
++}
++
++func (r *fakeRevocationRepo) GetLatestByCertificateId(ctx context.Context, certificateId string) (*domain.CertificateRevocation, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var latest *domain.CertificateRevocation
++	for _, a := range r.store {
++		if a.CertificateRef != certificateId {
++			continue
++		}
++		if latest == nil || a.CreatedAt.After(latest.CreatedAt) {
++			latest = a
++		}
++	}
++	if latest == nil {
++		return nil, domain.ErrRecordNotFound
++	}
++	return cloneAttempt(latest), nil
++}
++
++func (r *fakeRevocationRepo) ListProcessing(ctx context.Context) ([]*domain.CertificateRevocation, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var ret []*domain.CertificateRevocation
++	for _, a := range r.store {
++		if a.Status == domain.CertificateRevocationStatusTypeProcessing.String() {
++			ret = append(ret, cloneAttempt(a))
++		}
++	}
++	return ret, nil
++}
++
++func (r *fakeRevocationRepo) ListUnconverged(ctx context.Context) ([]*domain.CertificateRevocation, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	var ret []*domain.CertificateRevocation
++	for _, a := range r.store {
++		if a.Status == domain.CertificateRevocationStatusTypeSucceeded.String() && !a.Converged {
++			ret = append(ret, cloneAttempt(a))
++		}
++	}
++	return ret, nil
++}
++
++func (r *fakeRevocationRepo) CreateProcessingIfAbsent(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, bool, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.createErr != nil {
++		return nil, false, r.createErr
++	}
++	for _, a := range r.store {
++		if a.CertificateRef == attempt.CertificateRef && a.Status == domain.CertificateRevocationStatusTypeProcessing.String() {
++			return cloneAttempt(a), false, nil
++		}
++	}
++	r.seq++
++	if attempt.Id == "" {
++		attempt.Id = fmt.Sprintf("att-%d", r.seq)
++	}
++	if attempt.CreatedAt.IsZero() {
++		attempt.CreatedAt = time.Unix(1700000000, 0).Add(time.Duration(r.seq) * time.Second)
++		attempt.UpdatedAt = attempt.CreatedAt
++	}
++	r.store[attempt.Id] = cloneAttempt(attempt)
++	return cloneAttempt(attempt), true, nil
++}
++
++func (r *fakeRevocationRepo) Save(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, error) {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	if r.saveFailures > 0 {
++		r.saveFailures--
++		return attempt, fmt.Errorf("simulated attempt save failure")
++	}
++	if attempt.Id == "" {
++		r.seq++
++		attempt.Id = fmt.Sprintf("att-%d", r.seq)
++		if attempt.CreatedAt.IsZero() {
++			attempt.CreatedAt = time.Unix(1700000000, 0).Add(time.Duration(r.seq) * time.Second)
++		}
++	}
++	attempt.UpdatedAt = time.Now()
++	r.store[attempt.Id] = cloneAttempt(attempt)
++	return cloneAttempt(attempt), nil
++}
++
++func (r *fakeRevocationRepo) countByCert(certId string) int {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	n := 0
++	for _, a := range r.store {
++		if a.CertificateRef == certId {
++			n++
++		}
++	}
++	return n
++}
++
++func (r *fakeRevocationRepo) seed(attempt *domain.CertificateRevocation) *domain.CertificateRevocation {
++	r.mu.Lock()
++	defer r.mu.Unlock()
++	r.seq++
++	attempt.Id = fmt.Sprintf("att-seed-%d", r.seq)
++	if attempt.CreatedAt.IsZero() {
++		attempt.CreatedAt = time.Unix(1700000000, 0).Add(time.Duration(r.seq) * time.Second)
++		attempt.UpdatedAt = attempt.CreatedAt
++	}
++	r.store[attempt.Id] = cloneAttempt(attempt)
++	return cloneAttempt(attempt)
++}
++
++type fakeRevokeInvoker struct {
++	calls atomic.Int32
++	// prepareErr simulates a local pre-call error (account/client).
++	prepareErr error
++	// doErr is returned by the CA call.
++	doErr error
++	// onDo is invoked inside the actual CA call; tests use it to assert the
++	// persisted attempt state at call time.
++	onDo func(certId string)
++	// gate blocks the CA call until release is closed (concurrency tests).
++	entered chan struct{}
++	release chan struct{}
++}
++
++func (i *fakeRevokeInvoker) Prepare(ctx context.Context, certificate *domain.Certificate) (revokeCall, error) {
++	if i.prepareErr != nil {
++		return nil, &revokeLocalError{err: i.prepareErr}
++	}
++	return func(callCtx context.Context) error {
++		if i.entered != nil {
++			select {
++			case i.entered <- struct{}{}:
++			default:
++			}
++		}
++		if i.release != nil {
++			select {
++			case <-i.release:
++			case <-callCtx.Done():
++				return callCtx.Err()
++			}
++		}
++		i.calls.Add(1)
++		if i.onDo != nil {
++			i.onDo(certificate.Id)
++		}
++		return i.doErr
++	}, nil
++}
++
++// ---------------- helpers ----------------
++
++func newTestService(certRepo *fakeCertRepo, attRepo *fakeRevocationRepo, invoker *fakeRevokeInvoker) *CertificateService {
++	setOwnerIDForTest("owner-test")
++	return &CertificateService{
++		certificateRepo: certRepo,
++		revocationRepo:  attRepo,
++		revokeInvoker:   invoker,
++	}
++}
++
++func issuedCertificate() *domain.Certificate {
++	return &domain.Certificate{
++		Meta:               domain.Meta{Id: "cert-1"},
++		Source:             domain.CertificateSourceTypeRequest,
++		Certificate:        "PEM",
++		CA:                 "letsencrypt",
++		ACMEAccountUrl:     "https://example.com/acct/1",
++		ACMECertificateUrl: "https://example.com/cert/1",
++	}
++}
++
++func revokeReq(confirm bool) *dtos.CertificateRevokeReq {
++	return &dtos.CertificateRevokeReq{CertificateId: "cert-1", Confirm: confirm}
++}
++
++func waitUntil(t *testing.T, timeout time.Duration, fn func() bool) {
++	t.Helper()
++	deadline := time.Now().Add(timeout)
++	for time.Now().Before(deadline) {
++		if fn() {
++			return
++		}
++		time.Sleep(5 * time.Millisecond)
++	}
++	t.Fatal("condition not met before timeout")
++}
++
++func assertDomainCode(t *testing.T, err error, code int) {
++	t.Helper()
++	var dErr *domain.Error
++	if err == nil {
++		t.Fatalf("expected error with code %d, got nil", code)
++	}
++	if !asDomainError(err, &dErr) || dErr.Code != code {
++		t.Fatalf("expected error code %d, got %v", code, err)
++	}
++}
++
++func asDomainError(err error, target **domain.Error) bool {
++	for err != nil {
++		if e, ok := err.(*domain.Error); ok {
++			*target = e
++			return true
++		}
++		type unwrapper interface{ Unwrap() error }
++		u, ok := err.(unwrapper)
++		if !ok {
++			return false
++		}
++		err = u.Unwrap()
++	}
++	return false
++}
++
++// ---------------- tests ----------------
++
++func TestRevokePersistsAttemptBeforeCACallAndConverges(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++	invoker.onDo = func(certId string) {
++		latest, err := attRepo.GetLatestByCertificateId(context.Background(), certId)
++		if err != nil {
++			t.Errorf("attempt must be persisted before CA call: %v", err)
++			return
++		}
++		if latest.Status != domain.CertificateRevocationStatusTypeProcessing.String() ||
++			latest.Stage != domain.CertificateRevocationStageTypeCalling.String() ||
++			latest.Owner == "" {
++			t.Errorf("attempt state at CA call = %s/%s owner=%q, want processing/calling with owner",
++				latest.Status, latest.Stage, latest.Owner)
++		}
++	}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	resp, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("RevokeCertificate: %v", err)
++	}
++	if resp.Status != domain.CertificateRevocationStatusTypeSucceeded.String() || resp.AttemptId == "" {
++		t.Fatalf("unexpected resp: %+v", resp)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	if !certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate should be converged to revoked")
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if latest.Status != "succeeded" || !latest.Converged {
++		t.Fatalf("attempt = %s converged=%v, want succeeded/converged", latest.Status, latest.Converged)
++	}
++}
++
++func TestRevokeConcurrentRequestsShareSingleCACall(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{
++		entered: make(chan struct{}, 1),
++		release: make(chan struct{}),
++	}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	const n = 5
++	var wg sync.WaitGroup
++	errs := make([]error, n)
++	wg.Add(n)
++	for i := 0; i < n; i++ {
++		go func(i int) {
++			defer wg.Done()
++			_, errs[i] = s.RevokeCertificate(context.Background(), revokeReq(false))
++		}(i)
++	}
++
++	select {
++	case <-invoker.entered:
++	case <-time.After(2 * time.Second):
++		t.Fatal("CA call never started")
++	}
++	close(invoker.release)
++	wg.Wait()
++
++	for i, err := range errs {
++		if err != nil && err.Error() != "could not revoke a certificate which is already revoked" {
++			t.Fatalf("request %d: %v", i, err)
++		}
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 1 {
++		t.Fatalf("attempt records = %d, want 1", attRepo.countByCert("cert-1"))
++	}
++}
++
++func TestRevokeExplicitRejectionFailsAndAllowsNewAttempt(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{doErr: &acme.ProblemDetails{Type: acme.UnauthorizedErrorType, HTTPStatus: 403}}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil {
++		t.Fatal("expected rejection error")
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	first, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if first.Status != domain.CertificateRevocationStatusTypeFailed.String() || first.ErrorStatusCode != 403 {
++		t.Fatalf("attempt = %s/%d, want failed/403", first.Status, first.ErrorStatusCode)
++	}
++	if certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate must stay not revoked after explicit rejection")
++	}
++
++	// regular entry point starts a new attempt (without confirm)
++	invoker.doErr = nil
++	_, err = s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("second attempt: %v", err)
++	}
++	if invoker.calls.Load() != 2 {
++		t.Fatalf("CA calls = %d, want 2", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 2 {
++		t.Fatalf("attempt records = %d, want 2", attRepo.countByCert("cert-1"))
++	}
++	if !certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate should be revoked after successful retry")
++	}
++}
++
++func TestRevokeUnknownBlocksBlindResendUntilConfirmed(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{doErr: context.DeadlineExceeded}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	assertDomainCode(t, err, 409)
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	first, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if first.Status != domain.CertificateRevocationStatusTypeUnknown.String() || first.ErrorType != revokeErrorTypeTimeout {
++		t.Fatalf("attempt = %s/%s, want unknown/timeout", first.Status, first.ErrorType)
++	}
++
++	// blind resend without explicit confirmation must not contact the CA
++	_, err = s.RevokeCertificate(context.Background(), revokeReq(false))
++	assertDomainCode(t, err, 409)
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d after unconfirmed retry, want still 1", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 1 {
++		t.Fatalf("no new attempt may be created without confirmation, got %d", attRepo.countByCert("cert-1"))
++	}
++
++	// explicit confirmation starts a new attempt
++	invoker.doErr = nil
++	_, err = s.RevokeCertificate(context.Background(), revokeReq(true))
++	if err != nil {
++		t.Fatalf("confirmed retry: %v", err)
++	}
++	if invoker.calls.Load() != 2 {
++		t.Fatalf("CA calls = %d after confirm, want 2", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 2 {
++		t.Fatalf("attempt records after confirm = %d, want 2", attRepo.countByCert("cert-1"))
++	}
++}
++
++func TestRevokeSucceededButLocalSaveFailsConvergesWithoutSecondCall(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	certRepo.failNextSave("cert-1", 1)
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil {
++		t.Fatal("expected local-save error on first request")
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	first, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if first.Status != domain.CertificateRevocationStatusTypeSucceeded.String() || first.Converged {
++		t.Fatalf("attempt = %s converged=%v, want succeeded/not converged", first.Status, first.Converged)
++	}
++
++	// follow-up request converges locally only
++	resp, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("converge request: %v", err)
++	}
++	if resp.Status != domain.CertificateRevocationStatusTypeSucceeded.String() {
++		t.Fatalf("status = %q", resp.Status)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d after convergence, want still 1", invoker.calls.Load())
++	}
++	if !certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate should be revoked after local convergence")
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if !latest.Converged {
++		t.Fatal("attempt should be marked converged")
++	}
++}
++
++func TestPreparedLeftoverIsSafelyTakenOver(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++
++	// leftover from a dead owner, never reached the CA
++	attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-1",
++		Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++		Stage:          domain.CertificateRevocationStageTypePrepared.String(),
++		Owner:          "owner-dead",
++		Heartbeat:      time.Now().Add(-time.Hour),
++		StartedAt:      time.Now().Add(-time.Hour),
++	})
++	s := newTestService(certRepo, attRepo, invoker)
++
++	resp, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("takeover: %v", err)
++	}
++	if resp.Status != domain.CertificateRevocationStatusTypeSucceeded.String() {
++		t.Fatalf("status = %q", resp.Status)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want exactly 1 after takeover", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 1 {
++		t.Fatalf("takeover must reuse the same attempt record, got %d", attRepo.countByCert("cert-1"))
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if latest.Owner != "owner-test" || latest.Status != "succeeded" {
++		t.Fatalf("attempt owner=%s status=%s", latest.Owner, latest.Status)
++	}
++}
++
++func TestCallingLeftoverBecomesUnknownWithoutCallingCA(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++	attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-1",
++		Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++		Stage:          domain.CertificateRevocationStageTypeCalling.String(),
++		Owner:          "owner-dead",
++		Heartbeat:      time.Now().Add(-time.Hour),
++		StartedAt:      time.Now().Add(-time.Hour),
++	})
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	assertDomainCode(t, err, 409)
++	if invoker.calls.Load() != 0 {
++		t.Fatalf("CA calls = %d, want 0", invoker.calls.Load())
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if latest.Status != domain.CertificateRevocationStatusTypeUnknown.String() {
++		t.Fatalf("status = %s, want unknown", latest.Status)
++	}
++	if latest.ErrorMessage == "" {
++		t.Fatal("unknown attempt must carry a diagnostic message")
++	}
++}
++
++func TestAlreadyRevokedResponseConvergesLocally(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{doErr: &acme.ProblemDetails{Type: acme.AlreadyRevokedErrorType, HTTPStatus: 400}}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	resp, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("alreadyRevoked should converge: %v", err)
++	}
++	if resp.Status != domain.CertificateRevocationStatusTypeSucceeded.String() {
++		t.Fatalf("status = %q", resp.Status)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++	if !certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate should be converged to revoked")
++	}
++
++	// second request must not call the CA and keeps the existing rejection
++	// semantics once locally revoked
++	_, err = s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil || err.Error() != "could not revoke a certificate which is already revoked" {
++		t.Fatalf("legacy already-revoked error expected, got %v", err)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want still 1", invoker.calls.Load())
++	}
++}
++
++func TestSucceededAttemptWithDeletedCertificateIsConverged(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	certRepo.delete("cert-1")
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++	seeded := attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-1",
++		Status:         domain.CertificateRevocationStatusTypeSucceeded.String(),
++		Stage:          domain.CertificateRevocationStageTypeCalling.String(),
++		Converged:      false,
++		EndedAt:        time.Now(),
++	})
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("deleted certificate should converge without error: %v", err)
++	}
++	if invoker.calls.Load() != 0 {
++		t.Fatalf("CA calls = %d, want 0", invoker.calls.Load())
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if !latest.Converged || latest.Id != seeded.Id {
++		t.Fatal("existing succeeded attempt should be marked converged")
++	}
++}
++
++func TestRevokeCompatibilityGuards(t *testing.T) {
++	// not issued in Certimate (no ACME urls)
++	certRepo := newFakeCertRepo()
++	c := issuedCertificate()
++	c.ACMEAccountUrl = ""
++	c.ACMECertificateUrl = ""
++	certRepo.seed(c)
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil || err.Error() != "could not revoke a certificate which is not issued in Certimate" {
++		t.Fatalf("not-issued error expected, got %v", err)
++	}
++	if invoker.calls.Load() != 0 || attRepo.countByCert("cert-1") != 0 {
++		t.Fatal("no attempt/CA call expected before validation")
++	}
++
++	// legacy revoked certificate (isRevoked without attempt)
++	certRepo2 := newFakeCertRepo()
++	c2 := issuedCertificate()
++	c2.IsRevoked = true
++	certRepo2.seed(c2)
++	attRepo2 := newFakeRevocationRepo()
++	invoker2 := &fakeRevokeInvoker{}
++	s2 := newTestService(certRepo2, attRepo2, invoker2)
++	_, err = s2.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil || err.Error() != "could not revoke a certificate which is already revoked" {
++		t.Fatalf("already-revoked error expected, got %v", err)
++	}
++	if invoker2.calls.Load() != 0 {
++		t.Fatal("no CA call expected for already revoked certificate")
++	}
++}
++
++func TestLocalPreparationErrorRecordsDefinitiveFailure(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{prepareErr: fmt.Errorf("account missing")}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil {
++		t.Fatal("expected preparation error")
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if latest.Status != domain.CertificateRevocationStatusTypeFailed.String() || latest.ErrorType != revokeErrorTypeLocal {
++		t.Fatalf("attempt = %s/%s, want failed/local", latest.Status, latest.ErrorType)
++	}
++	if certRepo.isRevoked("cert-1") {
++		t.Fatal("certificate must stay not revoked")
++	}
++
++	// retry through the regular entry point
++	invoker.prepareErr = nil
++	_, err = s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err != nil {
++		t.Fatalf("retry: %v", err)
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("CA calls = %d, want 1", invoker.calls.Load())
++	}
++}
++
++func TestRecoverInterruptedResolvesAllLeftovers(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	c1 := issuedCertificate()
++	certRepo.seed(c1)
++	c2 := issuedCertificate()
++	c2.Id = "cert-2"
++	certRepo.seed(c2)
++	c3 := issuedCertificate()
++	c3.Id = "cert-3"
++	certRepo.seed(c3)
++
++	attRepo := newFakeRevocationRepo()
++	invoker := &fakeRevokeInvoker{}
++
++	// cert-1: prepared leftover -> take over and call CA once
++	attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-1",
++		Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++		Stage:          domain.CertificateRevocationStageTypePrepared.String(),
++		Owner:          "owner-dead",
++		Heartbeat:      time.Now().Add(-time.Hour),
++		StartedAt:      time.Now().Add(-time.Hour),
++	})
++	// cert-2: calling leftover -> unknown, no CA call
++	attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-2",
++		Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++		Stage:          domain.CertificateRevocationStageTypeCalling.String(),
++		Owner:          "owner-dead",
++		Heartbeat:      time.Now().Add(-time.Hour),
++		StartedAt:      time.Now().Add(-time.Hour),
++	})
++	// cert-3: succeeded but unconverged -> local convergence only
++	attRepo.seed(&domain.CertificateRevocation{
++		CertificateRef: "cert-3",
++		Status:         domain.CertificateRevocationStatusTypeSucceeded.String(),
++		Stage:          domain.CertificateRevocationStageTypeCalling.String(),
++		Converged:      false,
++		StartedAt:      time.Now().Add(-time.Hour),
++		EndedAt:        time.Now().Add(-time.Hour),
++	})
++	s := newTestService(certRepo, attRepo, invoker)
++
++	if err := s.RecoverInterrupted(context.Background()); err != nil {
++		t.Fatalf("RecoverInterrupted: %v", err)
++	}
++
++	waitUntil(t, 2*time.Second, func() bool {
++		return invoker.calls.Load() == 1 &&
++			certRepo.isRevoked("cert-1") &&
++			certRepo.isRevoked("cert-3")
++	})
++
++	a1, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if a1.Status != domain.CertificateRevocationStatusTypeSucceeded.String() || !a1.Converged {
++		t.Fatalf("cert-1 attempt = %s/%v, want succeeded/converged", a1.Status, a1.Converged)
++	}
++	a2, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-2")
++	if a2.Status != domain.CertificateRevocationStatusTypeUnknown.String() {
++		t.Fatalf("cert-2 attempt = %s, want unknown", a2.Status)
++	}
++	a3, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-3")
++	if !a3.Converged {
++		t.Fatal("cert-3 attempt should be converged")
++	}
++	if invoker.calls.Load() != 1 {
++		t.Fatalf("total CA calls = %d, want 1 (only the prepared leftover)", invoker.calls.Load())
++	}
++}
++
++func TestRevokeAbortsWhenAttemptCannotBePersisted(t *testing.T) {
++	// attempt row creation fails: the CA must never be contacted
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	attRepo.createErr = errors.New("database is unavailable")
++	invoker := &fakeRevokeInvoker{}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil {
++		t.Fatal("expected persistence error")
++	}
++	if invoker.calls.Load() != 0 {
++		t.Fatalf("CA calls = %d, want 0 when attempt persistence fails", invoker.calls.Load())
++	}
++	if attRepo.countByCert("cert-1") != 0 {
++		t.Fatal("no attempt record may exist after a failed create")
++	}
++}
++
++func TestRevokeAbortsWhenCallingStagePersistFails(t *testing.T) {
++	certRepo := newFakeCertRepo()
++	certRepo.seed(issuedCertificate())
++	attRepo := newFakeRevocationRepo()
++	attRepo.saveFailures = 1 // the first Save after create is the calling-stage write
++	invoker := &fakeRevokeInvoker{}
++	s := newTestService(certRepo, attRepo, invoker)
++
++	_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++	if err == nil {
++		t.Fatal("expected calling-stage persistence error")
++	}
++	if invoker.calls.Load() != 0 {
++		t.Fatalf("CA calls = %d, want 0 when calling stage cannot be persisted", invoker.calls.Load())
++	}
++	latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++	if latest.Status != domain.CertificateRevocationStatusTypeProcessing.String() ||
++		latest.Stage != domain.CertificateRevocationStageTypePrepared.String() {
++		t.Fatalf("attempt = %s/%s, want processing/prepared leftover", latest.Status, latest.Stage)
++	}
++}
++
++func TestProcessingAttemptForMissingCertificateIsClosed(t *testing.T) {
++	cases := []struct {
++		name       string
++		stage      string
++		wantStatus string
++		wantType   string
++	}{
++		{
++			name:       "prepared leftover",
++			stage:      domain.CertificateRevocationStageTypePrepared.String(),
++			wantStatus: domain.CertificateRevocationStatusTypeFailed.String(),
++			wantType:   revokeErrorTypeLocal,
++		},
++		{
++			name:       "calling leftover",
++			stage:      domain.CertificateRevocationStageTypeCalling.String(),
++			wantStatus: domain.CertificateRevocationStatusTypeUnknown.String(),
++			wantType:   revokeErrorTypeInterrupted,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			certRepo := newFakeCertRepo()
++			certRepo.seed(issuedCertificate())
++			certRepo.delete("cert-1")
++			attRepo := newFakeRevocationRepo()
++			invoker := &fakeRevokeInvoker{}
++			attRepo.seed(&domain.CertificateRevocation{
++				CertificateRef: "cert-1",
++				Status:         domain.CertificateRevocationStatusTypeProcessing.String(),
++				Stage:          tc.stage,
++				Owner:          "owner-dead",
++				Heartbeat:      time.Now().Add(-time.Hour),
++				StartedAt:      time.Now().Add(-time.Hour),
++			})
++			s := newTestService(certRepo, attRepo, invoker)
++
++			_, err := s.RevokeCertificate(context.Background(), revokeReq(false))
++			if !domain.IsRecordNotFoundError(err) {
++				t.Fatalf("expected not-found error, got %v", err)
++			}
++			if invoker.calls.Load() != 0 {
++				t.Fatalf("CA calls = %d, want 0", invoker.calls.Load())
++			}
++			latest, _ := attRepo.GetLatestByCertificateId(context.Background(), "cert-1")
++			if latest.Status != tc.wantStatus {
++				t.Fatalf("status = %s, want %s", latest.Status, tc.wantStatus)
++			}
++			if latest.ErrorType != tc.wantType || latest.ErrorMessage == "" || latest.EndedAt.IsZero() {
++				t.Fatalf("terminal attempt is missing diagnostics: %+v", latest)
++			}
++
++			// recovery must no longer enqueue the closed attempt
++			processing, err := attRepo.ListProcessing(context.Background())
++			if err != nil || len(processing) != 0 {
++				t.Fatalf("processing leftovers = %d (err=%v), want 0", len(processing), err)
++			}
++		})
++	}
++}
+diff --git a/internal/certificate/revoke_classifier.go b/internal/certificate/revoke_classifier.go
+new file mode 100644
+index 00000000..3c0635e4
+--- /dev/null
++++ b/internal/certificate/revoke_classifier.go
+@@ -0,0 +1,115 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"net"
++
++	"github.com/go-acme/lego/v5/acme"
++)
++
++// revokeOutcome is the conservative classification of an ACME revocation
++// call. Anything that cannot be proven to be a definitive success or a
++// definitive 4xx rejection falls into "unknown" so that the system never
++// blindly resends the request.
++type revokeOutcome string
++
++const (
++	revokeOutcomeSucceeded revokeOutcome = "succeeded"
++	revokeOutcomeFailed    revokeOutcome = "failed"
++	revokeOutcomeUnknown   revokeOutcome = "unknown"
++)
++
++const (
++	revokeErrorTypeTimeout     = "timeout"
++	revokeErrorTypeCanceled    = "canceled"
++	revokeErrorTypeNetwork     = "network"
++	revokeErrorTypeRejected    = "rejected"
++	revokeErrorTypeRemote      = "remote"
++	revokeErrorTypeInterrupted = "interrupted"
++	revokeErrorTypeLocal       = "local"
++	revokeErrorTypeUnknown     = "unknown"
++)
++
++type revokeErrorResult struct {
++	outcome    revokeOutcome
++	errorType  string
++	statusCode int
++	message    string
++}
++
++// classifyRevokeError classifies the error returned by the ACME revocation
++// call:
++//   - nil                                        -> succeeded
++//   - acme alreadyRevoked problem                -> succeeded (already revoked remotely)
++//   - acme ProblemDetails with a 4xx HTTP status -> failed (explicit rejection)
++//   - everything else (5xx, timeout, network, ..)-> unknown (remote result not provable)
++func classifyRevokeError(err error) revokeErrorResult {
++	if err == nil {
++		return revokeErrorResult{outcome: revokeOutcomeSucceeded}
++	}
++
++	var problem *acme.ProblemDetails
++	if errors.As(err, &problem) && problem != nil {
++		if problem.Type == acme.AlreadyRevokedErrorType {
++			return revokeErrorResult{
++				outcome:    revokeOutcomeSucceeded,
++				errorType:  acme.AlreadyRevokedErrorType,
++				statusCode: problem.HTTPStatus,
++				message:    problem.Error(),
++			}
++		}
++
++		if problem.HTTPStatus >= 400 && problem.HTTPStatus < 500 {
++			return revokeErrorResult{
++				outcome:    revokeOutcomeFailed,
++				errorType:  nonEmpty(problem.Type, revokeErrorTypeRejected),
++				statusCode: problem.HTTPStatus,
++				message:    problem.Error(),
++			}
++		}
++
++		return revokeErrorResult{
++			outcome:    revokeOutcomeUnknown,
++			errorType:  nonEmpty(problem.Type, revokeErrorTypeRemote),
++			statusCode: problem.HTTPStatus,
++			message:    problem.Error(),
++		}
++	}
++
++	switch {
++	case errors.Is(err, context.DeadlineExceeded):
++		return revokeErrorResult{outcome: revokeOutcomeUnknown, errorType: revokeErrorTypeTimeout, message: err.Error()}
++	case errors.Is(err, context.Canceled):
++		return revokeErrorResult{outcome: revokeOutcomeUnknown, errorType: revokeErrorTypeCanceled, message: err.Error()}
++	}
++
++	var netErr net.Error
++	if errors.As(err, &netErr) {
++		return revokeErrorResult{outcome: revokeOutcomeUnknown, errorType: revokeErrorTypeNetwork, message: err.Error()}
++	}
++
++	return revokeErrorResult{outcome: revokeOutcomeUnknown, errorType: revokeErrorTypeUnknown, message: err.Error()}
++}
++
++// classifyLocalError classifies an error that occurred before the ACME
++// revocation endpoint was reached (account lookup, client initialization).
++// The CA was never contacted, so the attempt is a definitive failure that the
++// admin can retry through the regular entry point.
++func classifyLocalError(err error) revokeErrorResult {
++	if err == nil {
++		return revokeErrorResult{outcome: revokeOutcomeSucceeded}
++	}
++	return revokeErrorResult{
++		outcome:   revokeOutcomeFailed,
++		errorType: revokeErrorTypeLocal,
++		message:   err.Error(),
++	}
++}
++
++func nonEmpty(v, fallback string) string {
++	if v == "" {
++		return fallback
++	}
++	return v
++}
+diff --git a/internal/certificate/revoke_classifier_test.go b/internal/certificate/revoke_classifier_test.go
+new file mode 100644
+index 00000000..f0155c09
+--- /dev/null
++++ b/internal/certificate/revoke_classifier_test.go
+@@ -0,0 +1,96 @@
++package certificate
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"testing"
++
++	"github.com/go-acme/lego/v5/acme"
++)
++
++type fakeNetError struct{}
++
++func (fakeNetError) Error() string   { return "connection refused" }
++func (fakeNetError) Timeout() bool   { return false }
++func (fakeNetError) Temporary() bool { return true }
++
++var _ net.Error = fakeNetError{}
++
++func TestClassifyRevokeError(t *testing.T) {
++	alreadyRevoked := &acme.ProblemDetails{
++		Type:       acme.AlreadyRevokedErrorType,
++		HTTPStatus: 400,
++		Detail:     "already revoked",
++	}
++	fourHundred := &acme.ProblemDetails{
++		Type:       acme.UnauthorizedErrorType,
++		HTTPStatus: 403,
++		Detail:     "unauthorized",
++	}
++	badReason := &acme.ProblemDetails{
++		Type:       acme.BadRevocationReasonErrorType,
++		HTTPStatus: 400,
++		Detail:     "bad reason",
++	}
++	serverInternal := &acme.ProblemDetails{
++		Type:       acme.ServerInternalErrorType,
++		HTTPStatus: 500,
++		Detail:     "boom",
++	}
++	zeroStatus := &acme.ProblemDetails{
++		Type:   acme.ServerInternalErrorType,
++		Detail: "no status",
++	}
++
++	cases := []struct {
++		name    string
++		err     error
++		want    revokeOutcome
++		wantTyp string
++	}{
++		{"nil", nil, revokeOutcomeSucceeded, ""},
++		{"already revoked", alreadyRevoked, revokeOutcomeSucceeded, acme.AlreadyRevokedErrorType},
++		{"already revoked wrapped", fmt.Errorf("wrap: %w", alreadyRevoked), revokeOutcomeSucceeded, acme.AlreadyRevokedErrorType},
++		{"403 unauthorized", fourHundred, revokeOutcomeFailed, acme.UnauthorizedErrorType},
++		{"400 bad revocation reason", badReason, revokeOutcomeFailed, acme.BadRevocationReasonErrorType},
++		{"403 wrapped", fmt.Errorf("failed to revoke: %w", fourHundred), revokeOutcomeFailed, acme.UnauthorizedErrorType},
++		{"500 server internal", serverInternal, revokeOutcomeUnknown, acme.ServerInternalErrorType},
++		{"zero http status", zeroStatus, revokeOutcomeUnknown, acme.ServerInternalErrorType},
++		{"deadline exceeded", context.DeadlineExceeded, revokeOutcomeUnknown, revokeErrorTypeTimeout},
++		{"deadline wrapped", fmt.Errorf("do request: %w", context.DeadlineExceeded), revokeOutcomeUnknown, revokeErrorTypeTimeout},
++		{"canceled", context.Canceled, revokeOutcomeUnknown, revokeErrorTypeCanceled},
++		{"network error", fakeNetError{}, revokeOutcomeUnknown, revokeErrorTypeNetwork},
++		{"network wrapped", fmt.Errorf("Post: %w", fakeNetError{}), revokeOutcomeUnknown, revokeErrorTypeNetwork},
++		{"eof", io.ErrUnexpectedEOF, revokeOutcomeUnknown, revokeErrorTypeUnknown},
++		{"plain error", errors.New("something strange"), revokeOutcomeUnknown, revokeErrorTypeUnknown},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			got := classifyRevokeError(tc.err)
++			if got.outcome != tc.want {
++				t.Fatalf("outcome = %q, want %q (type=%q)", got.outcome, tc.want, got.errorType)
++			}
++			if tc.wantTyp != "" && got.errorType != tc.wantTyp {
++				t.Fatalf("errorType = %q, want %q", got.errorType, tc.wantTyp)
++			}
++			if tc.err != nil && got.message == "" {
++				t.Fatalf("expected non-empty diagnostic message")
++			}
++		})
++	}
++}
++
++func TestClassifyLocalError(t *testing.T) {
++	if got := classifyLocalError(nil); got.outcome != revokeOutcomeSucceeded {
++		t.Fatalf("nil local error = %q, want succeeded", got.outcome)
++	}
++
++	got := classifyLocalError(errors.New("account missing"))
++	if got.outcome != revokeOutcomeFailed || got.errorType != revokeErrorTypeLocal {
++		t.Fatalf("local error = (%q, %q), want (failed, local)", got.outcome, got.errorType)
++	}
++}
+diff --git a/internal/certificate/service.go b/internal/certificate/service.go
+index 924bad21..874aa292 100644
+--- a/internal/certificate/service.go
++++ b/internal/certificate/service.go
+@@ -9,11 +9,12 @@ import (
+ 	"strings"
+ 
+ 	"github.com/pocketbase/dbx"
++	"golang.org/x/sync/singleflight"
+ 
+ 	"github.com/certimate-go/certimate/internal/app"
+-	"github.com/certimate-go/certimate/internal/certacme"
+ 	"github.com/certimate-go/certimate/internal/domain"
+ 	"github.com/certimate-go/certimate/internal/domain/dtos"
++	"github.com/certimate-go/certimate/internal/repository"
+ 	"github.com/certimate-go/certimate/internal/settings"
+ 	xcert "github.com/certimate-go/certimate/pkg/utils/cert"
+ 	xcertpfx "github.com/certimate-go/certimate/pkg/utils/cert/pfx"
+@@ -22,12 +23,20 @@ import (
+ type CertificateService struct {
+ 	acmeAccountRepo acmeAccountRepository
+ 	certificateRepo certificateRepository
++	revocationRepo  certificateRevocationRepository
++	revokeInvoker   revokeInvoker
++
++	// revokeFlights de-duplicates concurrent revocations of the same
++	// certificate within the current instance.
++	revokeFlights singleflight.Group
+ }
+ 
+ func NewCertificateService(acmeAccountRepo acmeAccountRepository, certificateRepo certificateRepository) *CertificateService {
+ 	return &CertificateService{
+ 		acmeAccountRepo: acmeAccountRepo,
+ 		certificateRepo: certificateRepo,
++		revocationRepo:  repository.NewCertificateRevocationRepository(),
++		revokeInvoker:   newACMERevokeInvoker(acmeAccountRepo),
+ 	}
+ }
+ 
+@@ -36,6 +45,12 @@ func (s *CertificateService) InitSchedule(ctx context.Context) error {
+ 		s.cleanupExpiredCertificates(context.Background())
+ 	})
+ 
++	// resolve revocation attempts left behind by a previous process once
++	// on startup; errors are logged and must not block serving
++	if err := s.RecoverInterrupted(ctx); err != nil {
++		app.GetLogger().Error("failed to recover interrupted revocation attempts", slog.Any("error", err))
++	}
++
+ 	return nil
+ }
+ 
+@@ -216,46 +231,6 @@ func (s *CertificateService) DownloadCertificate(ctx context.Context, req *dtos.
+ 	return resp, nil
+ }
+ 
+-func (s *CertificateService) RevokeCertificate(ctx context.Context, req *dtos.CertificateRevokeReq) (*dtos.CertificateRevokeResp, error) {
+-	certificate, err := s.certificateRepo.GetById(ctx, req.CertificateId)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	if certificate.ACMEAccountUrl == "" || certificate.ACMECertificateUrl == "" {
+-		return nil, fmt.Errorf("could not revoke a certificate which is not issued in Certimate")
+-	}
+-	if certificate.IsRevoked {
+-		return nil, fmt.Errorf("could not revoke a certificate which is already revoked")
+-	}
+-
+-	acmeAccount, err := s.acmeAccountRepo.GetByCAAndAcctUrl(ctx, certificate.CA, certificate.ACMEAccountUrl)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to revoke certificate: could not find acme account: %w", err)
+-	}
+-
+-	acmeClient, err := certacme.NewACMEClientWithAccount(acmeAccount)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to revoke certificate: could not initialize acme config: %w", err)
+-	}
+-
+-	revokeReq := &certacme.RevokeCertificateRequest{
+-		Certificate: certificate.Certificate,
+-	}
+-	_, err = acmeClient.RevokeCertificate(ctx, revokeReq)
+-	if err != nil {
+-		return nil, fmt.Errorf("failed to revoke certificate: %w", err)
+-	}
+-
+-	certificate.IsRevoked = true
+-	certificate, err = s.certificateRepo.Save(ctx, certificate)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return &dtos.CertificateRevokeResp{}, nil
+-}
+-
+ func (s *CertificateService) cleanupExpiredCertificates(ctx context.Context) error {
+ 	globalSettingsForPersistence := settings.GetGlobalSettingsForPersistence()
+ 	if globalSettingsForPersistence.CertificatesRetentionMaxDays != 0 {
+diff --git a/internal/certificate/service_deps.go b/internal/certificate/service_deps.go
+index 588ce8ae..b4e7fefd 100644
+--- a/internal/certificate/service_deps.go
++++ b/internal/certificate/service_deps.go
+@@ -17,3 +17,11 @@ type certificateRepository interface {
+ 	Save(ctx context.Context, certificate *domain.Certificate) (*domain.Certificate, error)
+ 	DeleteWithExprs(ctx context.Context, exprs ...dbx.Expression) (int, error)
+ }
++
++type certificateRevocationRepository interface {
++	GetLatestByCertificateId(ctx context.Context, certificateId string) (*domain.CertificateRevocation, error)
++	ListProcessing(ctx context.Context) ([]*domain.CertificateRevocation, error)
++	ListUnconverged(ctx context.Context) ([]*domain.CertificateRevocation, error)
++	CreateProcessingIfAbsent(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, bool, error)
++	Save(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, error)
++}
+diff --git a/internal/domain/certificate_revocation.go b/internal/domain/certificate_revocation.go
+new file mode 100644
+index 00000000..4aa600c0
+--- /dev/null
++++ b/internal/domain/certificate_revocation.go
+@@ -0,0 +1,64 @@
++package domain
++
++import "time"
++
++const CollectionNameCertificateRevocation = "certificate_revocation"
++
++// CertificateRevocationStatusType is the terminal/in-flight outcome of a
++// persisted certificate revocation attempt.
++type CertificateRevocationStatusType string
++
++func (t CertificateRevocationStatusType) String() string {
++	return string(t)
++}
++
++const (
++	// CertificateRevocationStatusTypeProcessing the attempt has been persisted
++	// and is owned by an instance, but no terminal result is known yet.
++	CertificateRevocationStatusTypeProcessing = CertificateRevocationStatusType("processing")
++	// CertificateRevocationStatusTypeSucceeded the CA explicitly acknowledged
++	// the revocation (or reported the certificate as already revoked).
++	CertificateRevocationStatusTypeSucceeded = CertificateRevocationStatusType("succeeded")
++	// CertificateRevocationStatusTypeFailed the CA explicitly rejected the
++	// revocation request. A new attempt can be started through the regular
++	// revocation entry point.
++	CertificateRevocationStatusTypeFailed = CertificateRevocationStatusType("failed")
++	// CertificateRevocationStatusTypeUnknown the remote result could not be
++	// determined (timeout, connection interruption, 5xx, owner lost while the
++	// request was in flight). A new attempt requires explicit reconfirmation.
++	CertificateRevocationStatusTypeUnknown = CertificateRevocationStatusType("unknown")
++)
++
++// CertificateRevocationStageType marks whether the owner has reached the point
++// of actually calling the ACME revocation endpoint.
++type CertificateRevocationStageType string
++
++func (t CertificateRevocationStageType) String() string {
++	return string(t)
++}
++
++const (
++	// CertificateRevocationStageTypePrepared the attempt is persisted and
++	// owned, but the ACME endpoint has never been called. A restarted
++	// instance can safely take it over.
++	CertificateRevocationStageTypePrepared = CertificateRevocationStageType("prepared")
++	// CertificateRevocationStageTypeCalling the owner is/was about to call or
++	// is calling the ACME revocation endpoint. If the owner disappears in
++	// this stage, the remote result is unknown.
++	CertificateRevocationStageTypeCalling = CertificateRevocationStageType("calling")
++)
++
++type CertificateRevocation struct {
++	Meta
++	CertificateRef  string    `db:"certificateRef"  json:"certificateRef"`
++	Status          string    `db:"status"          json:"status"`
++	Stage           string    `db:"stage"           json:"stage"`
++	Owner           string    `db:"owner"           json:"owner"`
++	Heartbeat       time.Time `db:"heartbeat"       json:"heartbeat"`
++	Converged       bool      `db:"converged"       json:"converged"`
++	ErrorType       string    `db:"errorType"       json:"errorType"`
++	ErrorStatusCode int       `db:"errorStatusCode" json:"errorStatusCode"`
++	ErrorMessage    string    `db:"errorMessage"    json:"errorMessage"`
++	StartedAt       time.Time `db:"startedAt"       json:"startedAt"`
++	EndedAt         time.Time `db:"endedAt"         json:"endedAt"`
++}
+diff --git a/internal/domain/dtos/certificate.go b/internal/domain/dtos/certificate.go
+index 9a3cd455..756c55bb 100644
+--- a/internal/domain/dtos/certificate.go
++++ b/internal/domain/dtos/certificate.go
+@@ -20,6 +20,12 @@ type CertificateDownloadResp struct {
+ 
+ type CertificateRevokeReq struct {
+ 	CertificateId string `json:"-"`
++	// Confirm explicitly reconfirms that a new revocation attempt may be
++	// started when the latest attempt ended in an unknown state.
++	Confirm bool `json:"confirm,omitempty"`
+ }
+ 
+-type CertificateRevokeResp struct{}
++type CertificateRevokeResp struct {
++	AttemptId string `json:"attemptId,omitempty"`
++	Status    string `json:"status,omitempty"`
++}
+diff --git a/internal/repository/certificate_revocation.go b/internal/repository/certificate_revocation.go
+new file mode 100644
+index 00000000..4479b571
+--- /dev/null
++++ b/internal/repository/certificate_revocation.go
+@@ -0,0 +1,221 @@
++package repository
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++
++	"github.com/pocketbase/dbx"
++	"github.com/pocketbase/pocketbase/core"
++
++	"github.com/certimate-go/certimate/internal/app"
++	"github.com/certimate-go/certimate/internal/domain"
++)
++
++type CertificateRevocationRepository struct{}
++
++func NewCertificateRevocationRepository() *CertificateRevocationRepository {
++	return &CertificateRevocationRepository{}
++}
++
++func (r *CertificateRevocationRepository) GetLatestByCertificateId(ctx context.Context, certificateId string) (*domain.CertificateRevocation, error) {
++	records, err := app.GetApp().FindRecordsByFilter(
++		domain.CollectionNameCertificateRevocation,
++		"certificateRef={:certificateId}",
++		"-created",
++		1, 0,
++		dbx.Params{"certificateId": certificateId},
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	if len(records) == 0 {
++		return nil, domain.ErrRecordNotFound
++	}
++
++	return r.castRecordToModel(records[0])
++}
++
++func (r *CertificateRevocationRepository) ListProcessing(ctx context.Context) ([]*domain.CertificateRevocation, error) {
++	records, err := app.GetApp().FindAllRecords(
++		domain.CollectionNameCertificateRevocation,
++		dbx.NewExp("status={:status}", dbx.Params{"status": domain.CertificateRevocationStatusTypeProcessing.String()}),
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	ret := make([]*domain.CertificateRevocation, 0, len(records))
++	for _, record := range records {
++		m, err := r.castRecordToModel(record)
++		if err != nil {
++			return nil, err
++		}
++		ret = append(ret, m)
++	}
++	return ret, nil
++}
++
++// ListUnconverged returns succeeded attempts whose local certificate state has
++// not been converged yet.
++func (r *CertificateRevocationRepository) ListUnconverged(ctx context.Context) ([]*domain.CertificateRevocation, error) {
++	records, err := app.GetApp().FindAllRecords(
++		domain.CollectionNameCertificateRevocation,
++		dbx.NewExp("status={:status} AND converged=0", dbx.Params{
++			"status": domain.CertificateRevocationStatusTypeSucceeded.String(),
++		}),
++	)
++	if err != nil {
++		return nil, err
++	}
++
++	ret := make([]*domain.CertificateRevocation, 0, len(records))
++	for _, record := range records {
++		m, err := r.castRecordToModel(record)
++		if err != nil {
++			return nil, err
++		}
++		ret = append(ret, m)
++	}
++	return ret, nil
++}
++
++// CreateProcessingIfAbsent persists a new processing/prepared attempt for the
++// certificate unless a processing attempt already exists. It returns the
++// attempt and true when a new record was created, or the existing processing
++// attempt and false when one already exists.
++func (r *CertificateRevocationRepository) CreateProcessingIfAbsent(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, bool, error) {
++	if attempt == nil {
++		return nil, false, fmt.Errorf("the attempt is nil")
++	}
++
++	created := false
++	txErr := app.GetApp().RunInTransaction(func(txApp core.App) error {
++		collection, err := txApp.FindCollectionByNameOrId(domain.CollectionNameCertificateRevocation)
++		if err != nil {
++			return err
++		}
++
++		existingRecord, err := txApp.FindFirstRecordByFilter(
++			domain.CollectionNameCertificateRevocation,
++			"certificateRef={:certificateId} && status={:status}",
++			dbx.Params{
++				"certificateId": attempt.CertificateRef,
++				"status":        domain.CertificateRevocationStatusTypeProcessing.String(),
++			},
++		)
++		if err != nil && !errors.Is(err, sql.ErrNoRows) {
++			return err
++		}
++
++		if existingRecord != nil {
++			existing, err := r.castRecordToModel(existingRecord)
++			if err != nil {
++				return err
++			}
++			attempt = existing
++			return nil
++		}
++
++		record := core.NewRecord(collection)
++		record.Set("certificateRef", attempt.CertificateRef)
++		record.Set("status", attempt.Status)
++		record.Set("stage", attempt.Stage)
++		record.Set("owner", attempt.Owner)
++		record.Set("heartbeat", attempt.Heartbeat)
++		record.Set("converged", attempt.Converged)
++		record.Set("errorType", attempt.ErrorType)
++		record.Set("errorStatusCode", attempt.ErrorStatusCode)
++		record.Set("errorMessage", attempt.ErrorMessage)
++		record.Set("startedAt", attempt.StartedAt)
++		record.Set("endedAt", attempt.EndedAt)
++		if err := txApp.Save(record); err != nil {
++			return err
++		}
++
++		persisted, err := r.castRecordToModel(record)
++		if err != nil {
++			return err
++		}
++		attempt = persisted
++		created = true
++		return nil
++	})
++	if txErr != nil {
++		return nil, false, txErr
++	}
++
++	return attempt, created, nil
++}
++
++func (r *CertificateRevocationRepository) Save(ctx context.Context, attempt *domain.CertificateRevocation) (*domain.CertificateRevocation, error) {
++	if attempt == nil {
++		return nil, fmt.Errorf("the attempt is nil")
++	}
++
++	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameCertificateRevocation)
++	if err != nil {
++		return attempt, err
++	}
++
++	var record *core.Record
++	if attempt.Id == "" {
++		record = core.NewRecord(collection)
++	} else {
++		record, err = app.GetApp().FindRecordById(collection, attempt.Id)
++		if err != nil {
++			if errors.Is(err, sql.ErrNoRows) {
++				return attempt, domain.ErrRecordNotFound
++			}
++			return attempt, err
++		}
++	}
++
++	record.Set("certificateRef", attempt.CertificateRef)
++	record.Set("status", attempt.Status)
++	record.Set("stage", attempt.Stage)
++	record.Set("owner", attempt.Owner)
++	record.Set("heartbeat", attempt.Heartbeat)
++	record.Set("converged", attempt.Converged)
++	record.Set("errorType", attempt.ErrorType)
++	record.Set("errorStatusCode", attempt.ErrorStatusCode)
++	record.Set("errorMessage", attempt.ErrorMessage)
++	record.Set("startedAt", attempt.StartedAt)
++	record.Set("endedAt", attempt.EndedAt)
++	if err := app.GetApp().Save(record); err != nil {
++		return attempt, err
++	}
++
++	attempt.Id = record.Id
++	attempt.CreatedAt = record.GetDateTime("created").Time()
++	attempt.UpdatedAt = record.GetDateTime("updated").Time()
++	return attempt, nil
++}
++
++func (r *CertificateRevocationRepository) castRecordToModel(record *core.Record) (*domain.CertificateRevocation, error) {
++	if record == nil {
++		return nil, fmt.Errorf("the record is nil")
++	}
++
++	attempt := &domain.CertificateRevocation{
++		Meta: domain.Meta{
++			Id:        record.Id,
++			CreatedAt: record.GetDateTime("created").Time(),
++			UpdatedAt: record.GetDateTime("updated").Time(),
++		},
++		CertificateRef:  record.GetString("certificateRef"),
++		Status:          record.GetString("status"),
++		Stage:           record.GetString("stage"),
++		Owner:           record.GetString("owner"),
++		Heartbeat:       record.GetDateTime("heartbeat").Time(),
++		Converged:       record.GetBool("converged"),
++		ErrorType:       record.GetString("errorType"),
++		ErrorStatusCode: record.GetInt("errorStatusCode"),
++		ErrorMessage:    record.GetString("errorMessage"),
++		StartedAt:       record.GetDateTime("startedAt").Time(),
++		EndedAt:         record.GetDateTime("endedAt").Time(),
++	}
++	return attempt, nil
++}
+diff --git a/migrations/1791849600_upgrade_v0.4.36.go b/migrations/1791849600_upgrade_v0.4.36.go
+new file mode 100644
+index 00000000..0ad57e2a
+--- /dev/null
++++ b/migrations/1791849600_upgrade_v0.4.36.go
+@@ -0,0 +1,59 @@
++package migrations
++
++import (
++	"errors"
++
++	"github.com/pocketbase/pocketbase/core"
++	m "github.com/pocketbase/pocketbase/migrations"
++
++	"github.com/certimate-go/certimate/internal/domain"
++)
++
++func init() {
++	m.Register(func(app core.App) error {
++		// skip if the collection already exists (idempotent upgrade)
++		if _, err := app.FindCollectionByNameOrId(domain.CollectionNameCertificateRevocation); err == nil {
++			return nil
++		}
++
++		tracer := NewTracer("v0.4.36")
++		tracer.Printf("go ...")
++
++		// create collection `certificate_revocation`
++		//   - persists certificate revocation attempts and their owner
++		//     before the ACME revocation is actually called
++		{
++			collection := core.NewBaseCollection(domain.CollectionNameCertificateRevocation)
++
++			collection.Fields.Add(
++				&core.TextField{Name: "certificateRef", Required: true},
++				&core.TextField{Name: "status", Required: true},
++				&core.TextField{Name: "stage"},
++				&core.TextField{Name: "owner"},
++				&core.DateField{Name: "heartbeat"},
++				&core.BoolField{Name: "converged"},
++				&core.TextField{Name: "errorType"},
++				&core.NumberField{Name: "errorStatusCode"},
++				&core.TextField{Name: "errorMessage"},
++				&core.DateField{Name: "startedAt"},
++				&core.DateField{Name: "endedAt"},
++			)
++
++			collection.Indexes = append(collection.Indexes,
++				"CREATE INDEX `idx_certRevCertRef` ON `certificate_revocation` (`certificateRef`)",
++				"CREATE INDEX `idx_certRevStatus` ON `certificate_revocation` (`status`)",
++			)
++
++			if err := app.Save(collection); err != nil {
++				return err
++			}
++
++			tracer.Printf("collection '%s' created", collection.Name)
++		}
++
++		tracer.Printf("done")
++		return nil
++	}, func(app core.App) error {
++		return errors.ErrUnsupported
++	})
++}
+diff --git a/ui/src/api/certificates.ts b/ui/src/api/certificates.ts
+index 94ec4a25..c3952cc0 100644
+--- a/ui/src/api/certificates.ts
++++ b/ui/src/api/certificates.ts
+@@ -20,8 +20,11 @@ export const download = (
+   });
+ };
+ 
+-export const revoke = (certificateId: string) => {
++export const revoke = (certificateId: string, confirm?: boolean) => {
+   return httpPost({
+     url: `/api/certificates/${encodeURIComponent(certificateId)}/revoke`,
++    body: {
++      confirm: confirm === true,
++    },
+   });
+ };
+diff --git a/ui/src/components/certificate/CertificateDetail.tsx b/ui/src/components/certificate/CertificateDetail.tsx
+index e0b85adb..42d8a09f 100644
+--- a/ui/src/components/certificate/CertificateDetail.tsx
++++ b/ui/src/components/certificate/CertificateDetail.tsx
+@@ -4,7 +4,7 @@ import { IconClipboard, IconDownload } from "@tabler/icons-react";
+ import { App, Button, Form, Input, Tag, Tooltip } from "antd";
+ import dayjs from "dayjs";
+ 
+-import { type CertificateModel } from "@/domain/certificate";
++import { CERTIFICATE_REVOCATION_STATUS, type CertificateModel } from "@/domain/certificate";
+ 
+ import CertificateDownloadModal from "./CertificateDownloadModal";
+ 
+@@ -51,7 +51,22 @@ const CertificateDetail = ({ data, ...props }: CertificateDetailProps) => {
+             value={`${dayjs(data.validityNotBefore).format("YYYY-MM-DD HH:mm:ss")} ~ ${dayjs(data.validityNotAfter).format("YYYY-MM-DD HH:mm:ss")}`}
+             variant="filled"
+             placeholder=""
+-            suffix={data.isRevoked ? <Tag color="error">{t("certificate.props.revoked")}</Tag> : <></>}
++            suffix={
++              data.isRevoked ? (
++                <Tag color="error">{t("certificate.props.revoked")}</Tag>
++              ) : data.revokeStatus === CERTIFICATE_REVOCATION_STATUS.UNKNOWN ? (
++                <Tooltip
++                  title={t("certificate.props.revocation_unknown.tip", {
++                    time: data.revokeEndedAt ? dayjs(data.revokeEndedAt).format("YYYY-MM-DD HH:mm:ss") : "",
++                    message: data.revokeErrorMessage || "",
++                  })}
++                >
++                  <Tag color="warning">{t("certificate.props.revocation_unknown")}</Tag>
++                </Tooltip>
++              ) : (
++                <></>
++              )
++            }
+           />
+         </Form.Item>
+ 
+diff --git a/ui/src/domain/certificate.ts b/ui/src/domain/certificate.ts
+index d91fd73a..564db3b6 100644
+--- a/ui/src/domain/certificate.ts
++++ b/ui/src/domain/certificate.ts
+@@ -16,11 +16,36 @@ export interface CertificateModel extends BaseModel {
+   isRenewed: boolean;
+   isRevoked: boolean;
+   workflowRef: string;
++  /** UI-only: latest revocation attempt state joined from certificate_revocation. */
++  revokeStatus?: CertificateRevocationStatusType;
++  revokeErrorMessage?: string;
++  revokeEndedAt?: ISO8601String;
+   expand?: {
+     workflowRef?: Pick<WorkflowModel, "id" | "name" | "description">;
+   };
+ }
+ 
++export interface CertificateRevocationModel extends BaseModel {
++  certificateRef: string;
++  status: CertificateRevocationStatusType;
++  stage?: string;
++  errorType?: string;
++  errorStatusCode?: number;
++  errorMessage?: string;
++  converged: boolean;
++  startedAt?: ISO8601String;
++  endedAt?: ISO8601String;
++}
++
++export const CERTIFICATE_REVOCATION_STATUS = Object.freeze({
++  PROCESSING: "processing",
++  SUCCEEDED: "succeeded",
++  FAILED: "failed",
++  UNKNOWN: "unknown",
++} as const);
++
++export type CertificateRevocationStatusType = (typeof CERTIFICATE_REVOCATION_STATUS)[keyof typeof CERTIFICATE_REVOCATION_STATUS];
++
+ export const CERTIFICATE_SOURCES = Object.freeze({
+   REQUEST: "request",
+   UPLOAD: "upload",
+diff --git a/ui/src/i18n/resources/en/nls.certificate.json b/ui/src/i18n/resources/en/nls.certificate.json
+index 2669422c..fd56787e 100644
+--- a/ui/src/i18n/resources/en/nls.certificate.json
++++ b/ui/src/i18n/resources/en/nls.certificate.json
+@@ -22,6 +22,11 @@
+       "title": "Revoke \"{{name}}\"",
+       "content": "Are you sure want to revoke this certificate? <br>This action cannot be undone."
+     },
++    "revoke.unknown.menu": "Reconfirm Revocation",
++    "revoke.unknown.modal": {
++      "title": "Reconfirm Revocation of \"{{name}}\"",
++      "content": "The last revocation attempt ended with a timeout or an interrupted connection, so the system cannot tell whether the CA has revoked this certificate.<br>It is not retried automatically to avoid duplicate revocation requests.<br>Confirm only if you are sure the certificate still needs to be revoked; a new revocation request will be sent to the CA."
++    },
+     "delete.menu": "Delete",
+     "delete.modal": {
+       "title": "Delete \"{{name}}\"",
+@@ -112,6 +117,8 @@
+     },
+     "brand": "Brand",
+     "revoked": "Revoked",
++    "revocation_unknown": "Revocation unknown",
++    "revocation_unknown.tip": "The last revocation ended at {{time}} and the CA result could not be confirmed. {{message}}",
+     "certificate": "Certificate chain",
+     "private_key": "Private key",
+     "serial_number": "Serial number",
+diff --git a/ui/src/i18n/resources/zh/nls.certificate.json b/ui/src/i18n/resources/zh/nls.certificate.json
+index a3c04ee8..a375cbd0 100644
+--- a/ui/src/i18n/resources/zh/nls.certificate.json
++++ b/ui/src/i18n/resources/zh/nls.certificate.json
+@@ -22,6 +22,11 @@
+       "title": "吊销「{{name}}」",
+       "content": "确定要吊销该证书吗？<br>注意此操作不可撤销，请谨慎操作。"
+     },
++    "revoke.unknown.menu": "重新确认吊销",
++    "revoke.unknown.modal": {
++      "title": "重新确认吊销「{{name}}」",
++      "content": "上一次吊销请求因超时或连接中断而结束，系统无法确认 CA 是否已吊销该证书。<br>为避免重复吊销，系统不会自动向 CA 重发请求。<br>只有在你确认该证书仍需吊销时，才点击确认，这将向 CA 重新发送一次吊销请求。"
++    },
+     "delete.menu": "删除证书",
+     "delete.modal": {
+       "title": "删除「{{name}}」",
+@@ -112,6 +117,8 @@
+     },
+     "brand": "证书品牌",
+     "revoked": "已吊销",
++    "revocation_unknown": "吊销结果未知",
++    "revocation_unknown.tip": "上一次吊销于 {{time}} 结束，无法确认 CA 处理结果。{{message}}",
+     "certificate": "证书内容",
+     "private_key": "私钥内容",
+     "serial_number": "证书序列号",
+diff --git a/ui/src/pages/certificates/CertificateList.tsx b/ui/src/pages/certificates/CertificateList.tsx
+index 3178d097..9e9e3904 100644
+--- a/ui/src/pages/certificates/CertificateList.tsx
++++ b/ui/src/pages/certificates/CertificateList.tsx
+@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
+ import { useNavigate, useSearchParams } from "react-router-dom";
+ import { IconBrowserShare, IconCertificate, IconDots, IconExternalLink, IconReload, IconShieldCancel, IconTrash } from "@tabler/icons-react";
+ import { useMount, useRequest } from "ahooks";
+-import { App, Button, Dropdown, Input, Segmented, Skeleton, Table, type TableProps, Typography, theme } from "antd";
++import { App, Button, Dropdown, Input, Segmented, Skeleton, Table, Tooltip, type TableProps, Typography, theme } from "antd";
+ import dayjs from "dayjs";
+ import { ClientResponseError } from "pocketbase";
+ 
+@@ -11,9 +11,10 @@ import { revoke as revokeCertificate } from "@/api/certificates";
+ import CertificateDetailDrawer from "@/components/certificate/CertificateDetailDrawer";
+ import Empty from "@/components/Empty";
+ import Show from "@/components/Show";
+-import { CERTIFICATE_SOURCES, type CertificateModel } from "@/domain/certificate";
++import { CERTIFICATE_REVOCATION_STATUS, CERTIFICATE_SOURCES, type CertificateModel, type CertificateRevocationModel } from "@/domain/certificate";
+ import { useAppSettings, useZustandShallowSelector } from "@/hooks";
+ import { get as getCertificate, list as listCertificates, remove as removeCertificate } from "@/repository/certificate";
++import { listLatestByCertificateIds } from "@/repository/certificateRevocation";
+ import { usePersistenceSettingsStore } from "@/stores/settings";
+ import { unwrapErrMsg } from "@/utils/error";
+ 
+@@ -54,6 +55,32 @@ const CertificateList = () => {
+   const [tableData, setTableData] = useState<CertificateModel[]>([]);
+   const [tableTotal, setTableTotal] = useState<number>(0);
+   const [tableSelectedRowKeys, setTableSelectedRowKeys] = useState<string[]>([]);
++  const [revocationMap, setRevocationMap] = useState<Map<string, CertificateRevocationModel>>(new Map());
++
++  // load the latest revocation attempt (if any) for the certificates shown on
++  // the current page; the attempt record is the source of the client-visible
++  // "revocation unknown" state
++  useEffect(() => {
++    if (tableData.length === 0) {
++      setRevocationMap(new Map());
++      return;
++    }
++
++    let cancelled = false;
++    listLatestByCertificateIds(tableData.map((item) => item.id))
++      .then((map) => {
++        if (!cancelled) {
++          setRevocationMap(map);
++        }
++      })
++      .catch((err) => {
++        console.error(err);
++      });
++
++    return () => {
++      cancelled = true;
++    };
++  }, [tableData]);
+   const tableColumns: TableProps<CertificateModel>["columns"] = [
+     {
+       key: "subjectName",
+@@ -107,9 +134,25 @@ const CertificateList = () => {
+         const leftHours = dayjs(record.validityNotAfter).diff(dayjs(), "h");
+         const leftDays = Math.round(leftHours / 24);
+ 
++        const unknownAttempt = revocationMap.get(record.id);
++        const revocationUnknown =
++          !isRevoked && unknownAttempt?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN;
++
+         return (
+           <div className="flex max-w-full flex-col gap-1 truncate">
+-            {!isRevoked && !isExpired ? (
++            {revocationUnknown ? (
++              <Tooltip
++                title={t("certificate.props.revocation_unknown.tip", {
++                  time: dayjs(unknownAttempt!.endedAt || unknownAttempt!.updated || unknownAttempt!.created).format("YYYY-MM-DD HH:mm:ss"),
++                  message: unknownAttempt!.errorMessage || "",
++                })}
++              >
++                <Typography.Text ellipsis type="warning">
++                  <span className="mr-2 inline-block size-2 rounded-full bg-warning leading-2">&nbsp;</span>
++                  {t("certificate.props.revocation_unknown")}
++                </Typography.Text>
++              </Tooltip>
++            ) : !isRevoked && !isExpired ? (
+               leftDays >= expiryThreshold ? (
+                 <Typography.Text ellipsis type="success">
+                   <span className="mr-2 inline-block size-2 rounded-full bg-success leading-2">&nbsp;</span>
+@@ -205,7 +248,10 @@ const CertificateList = () => {
+               },
+               {
+                 key: "revoke",
+-                label: t("certificate.action.revoke.menu"),
++                label:
++                  revocationMap.get(record.id)?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN && !record.isRevoked
++                    ? t("certificate.action.revoke.unknown.menu")
++                    : t("certificate.action.revoke.menu"),
+                 danger: true,
+                 disabled: record.source !== CERTIFICATE_SOURCES.REQUEST || record.isRevoked,
+                 icon: (
+@@ -214,7 +260,11 @@ const CertificateList = () => {
+                   </span>
+                 ),
+                 onClick: () => {
+-                  handleRecordRevokeClick(record);
++                  if (revocationMap.get(record.id)?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN && !record.isRevoked) {
++                    handleRecordReconfirmRevokeClick(record);
++                  } else {
++                    handleRecordRevokeClick(record);
++                  }
+                 },
+               },
+               {
+@@ -356,10 +406,49 @@ const CertificateList = () => {
+   const handleRecordDetailClick = (certificate: CertificateModel) => {
+     const drawer = detailDrawer.open({ data: certificate, loading: true });
+     getCertificate(certificate.id).then((data) => {
+-      drawer.safeUpdate({ data, loading: false });
++      const latestAttempt = revocationMap.get(certificate.id);
++      drawer.safeUpdate({
++        data: {
++          ...data,
++          revokeStatus: latestAttempt?.status,
++          revokeErrorMessage: latestAttempt?.errorMessage,
++          revokeEndedAt: latestAttempt?.endedAt || latestAttempt?.updated || latestAttempt?.created,
++        },
++        loading: false,
++      });
+     });
+   };
+ 
++  const doRevokeCertificate = async (certificate: CertificateModel, confirm: boolean) => {
++    try {
++      const resp = await revokeCertificate(certificate.id, confirm);
++      if (resp) {
++        message.success(t("common.text.operation_succeeded"));
++        setTableData((prev) =>
++          prev.map((item) =>
++            item.id === certificate.id
++              ? { ...item, isRevoked: true, revokeStatus: CERTIFICATE_REVOCATION_STATUS.SUCCEEDED }
++              : item
++          )
++        );
++        refreshData();
++      }
++    } catch (err) {
++      console.error(err);
++      if (err instanceof ClientResponseError && err.status === 409) {
++        // the revocation result is unknown; no blind retry happened, refresh
++        // the list so the unknown state becomes visible and diagnosable
++        notification.warning({
++          title: t("certificate.props.revocation_unknown"),
++          description: unwrapErrMsg(err),
++        });
++        refreshData();
++      } else {
++        notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++      }
++    }
++  };
++
+   const handleRecordRevokeClick = (certificate: CertificateModel) => {
+     modal.confirm({
+       title: <span className="text-error">{t("certificate.action.revoke.modal.title", { name: certificate.subjectAltNames })}</span>,
+@@ -371,19 +460,22 @@ const CertificateList = () => {
+       ),
+       okText: t("common.button.confirm"),
+       okButtonProps: { danger: true },
+-      onOk: async () => {
+-        try {
+-          const resp = await revokeCertificate(certificate.id);
+-          if (resp) {
+-            message.success(t("common.text.operation_succeeded"));
+-            setTableData((prev) => prev.map((item) => (item.id === certificate.id ? { ...item, isRevoked: true } : item)));
+-            refreshData();
+-          }
+-        } catch (err) {
+-          console.error(err);
+-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+-        }
+-      },
++      onOk: () => doRevokeCertificate(certificate, false),
++    });
++  };
++
++  const handleRecordReconfirmRevokeClick = (certificate: CertificateModel) => {
++    modal.confirm({
++      title: <span className="text-warning">{t("certificate.action.revoke.unknown.modal.title", { name: certificate.subjectAltNames })}</span>,
++      content: <span dangerouslySetInnerHTML={{ __html: t("certificate.action.revoke.unknown.modal.content") }} />,
++      icon: (
++        <span className="anticon" role="img">
++          <IconShieldCancel className="text-warning" size="1em" />
++        </span>
++      ),
++      okText: t("common.button.confirm"),
++      okButtonProps: { danger: true },
++      onOk: () => doRevokeCertificate(certificate, true),
+     });
+   };
+ 
+diff --git a/ui/src/repository/_pocketbase.ts b/ui/src/repository/_pocketbase.ts
+index ee4d9cea..705b2d3b 100644
+--- a/ui/src/repository/_pocketbase.ts
++++ b/ui/src/repository/_pocketbase.ts
+@@ -19,6 +19,7 @@ export const getPocketBase = () => {
+ export const COLLECTION_NAME_ADMIN = "_superusers";
+ export const COLLECTION_NAME_ACCESS = "access";
+ export const COLLECTION_NAME_CERTIFICATE = "certificate";
++export const COLLECTION_NAME_CERTIFICATE_REVOCATION = "certificate_revocation";
+ export const COLLECTION_NAME_SETTINGS = "settings";
+ export const COLLECTION_NAME_WORKFLOW = "workflow";
+ export const COLLECTION_NAME_WORKFLOW_RUN = "workflow_run";
+diff --git a/ui/src/repository/certificateRevocation.ts b/ui/src/repository/certificateRevocation.ts
+new file mode 100644
+index 00000000..737ff314
+--- /dev/null
++++ b/ui/src/repository/certificateRevocation.ts
+@@ -0,0 +1,63 @@
++import { type CertificateRevocationModel } from "@/domain/certificate";
++
++import { COLLECTION_NAME_CERTIFICATE_REVOCATION, getPocketBase } from "./_pocketbase";
++
++const pb = getPocketBase();
++const pbco = pb.collection(COLLECTION_NAME_CERTIFICATE_REVOCATION);
++
++const _commonFields = [
++  "id",
++  "certificateRef",
++  "status",
++  "stage",
++  "errorType",
++  "errorStatusCode",
++  "errorMessage",
++  "converged",
++  "startedAt",
++  "endedAt",
++  "created",
++  "updated",
++];
++
++const toLatestMap = (list: CertificateRevocationModel[]) => {
++  // the query is sorted by -created, so the first item per certificate is the
++  // latest attempt
++  const map = new Map<string, CertificateRevocationModel>();
++  for (const item of list) {
++    if (!map.has(item.certificateRef)) {
++      map.set(item.certificateRef, item);
++    }
++  }
++  return map;
++};
++
++/// Fetches the latest revocation attempt for each of the given certificates.
++export const listLatestByCertificateIds = async (certificateIds: string[]) => {
++  if (certificateIds.length === 0) {
++    return new Map<string, CertificateRevocationModel>();
++  }
++
++  const filters = certificateIds.map((id) => pb.filter("certificateRef={:id}", { id })).join(" || ");
++  const list = await pbco.getFullList<CertificateRevocationModel>({
++    batch: 65535,
++    fields: _commonFields.join(","),
++    filter: filters,
++    sort: "-created",
++    requestKey: null,
++  });
++
++  return toLatestMap(list);
++};
++
++/// Fetches the latest revocation attempt for a single certificate.
++export const getLatestByCertificateId = async (certificateId: string) => {
++  const list = await pbco.getFullList<CertificateRevocationModel>({
++    batch: 100,
++    fields: _commonFields.join(","),
++    filter: pb.filter("certificateRef={:certificateId}", { certificateId }),
++    sort: "-created",
++    requestKey: null,
++  });
++  return list[0] ?? null;
++};

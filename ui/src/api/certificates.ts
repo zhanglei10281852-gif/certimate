@@ -20,8 +20,11 @@ export const download = (
   });
 };
 
-export const revoke = (certificateId: string) => {
+export const revoke = (certificateId: string, confirm?: boolean) => {
   return httpPost({
     url: `/api/certificates/${encodeURIComponent(certificateId)}/revoke`,
+    body: {
+      confirm: confirm === true,
+    },
   });
 };

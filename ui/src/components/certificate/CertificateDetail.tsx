@@ -4,7 +4,7 @@ import { IconClipboard, IconDownload } from "@tabler/icons-react";
 import { App, Button, Form, Input, Tag, Tooltip } from "antd";
 import dayjs from "dayjs";
 
-import { type CertificateModel } from "@/domain/certificate";
+import { CERTIFICATE_REVOCATION_STATUS, type CertificateModel } from "@/domain/certificate";
 
 import CertificateDownloadModal from "./CertificateDownloadModal";
 
@@ -51,7 +51,22 @@ const CertificateDetail = ({ data, ...props }: CertificateDetailProps) => {
             value={`${dayjs(data.validityNotBefore).format("YYYY-MM-DD HH:mm:ss")} ~ ${dayjs(data.validityNotAfter).format("YYYY-MM-DD HH:mm:ss")}`}
             variant="filled"
             placeholder=""
-            suffix={data.isRevoked ? <Tag color="error">{t("certificate.props.revoked")}</Tag> : <></>}
+            suffix={
+              data.isRevoked ? (
+                <Tag color="error">{t("certificate.props.revoked")}</Tag>
+              ) : data.revokeStatus === CERTIFICATE_REVOCATION_STATUS.UNKNOWN ? (
+                <Tooltip
+                  title={t("certificate.props.revocation_unknown.tip", {
+                    time: data.revokeEndedAt ? dayjs(data.revokeEndedAt).format("YYYY-MM-DD HH:mm:ss") : "",
+                    message: data.revokeErrorMessage || "",
+                  })}
+                >
+                  <Tag color="warning">{t("certificate.props.revocation_unknown")}</Tag>
+                </Tooltip>
+              ) : (
+                <></>
+              )
+            }
           />
         </Form.Item>
 

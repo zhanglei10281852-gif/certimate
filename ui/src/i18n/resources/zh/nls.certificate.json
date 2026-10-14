@@ -22,6 +22,11 @@
       "title": "吊销「{{name}}」",
       "content": "确定要吊销该证书吗？<br>注意此操作不可撤销，请谨慎操作。"
     },
+    "revoke.unknown.menu": "重新确认吊销",
+    "revoke.unknown.modal": {
+      "title": "重新确认吊销「{{name}}」",
+      "content": "上一次吊销请求因超时或连接中断而结束，系统无法确认 CA 是否已吊销该证书。<br>为避免重复吊销，系统不会自动向 CA 重发请求。<br>只有在你确认该证书仍需吊销时，才点击确认，这将向 CA 重新发送一次吊销请求。"
+    },
     "delete.menu": "删除证书",
     "delete.modal": {
       "title": "删除「{{name}}」",
@@ -112,6 +117,8 @@
     },
     "brand": "证书品牌",
     "revoked": "已吊销",
+    "revocation_unknown": "吊销结果未知",
+    "revocation_unknown.tip": "上一次吊销于 {{time}} 结束，无法确认 CA 处理结果。{{message}}",
     "certificate": "证书内容",
     "private_key": "私钥内容",
     "serial_number": "证书序列号",

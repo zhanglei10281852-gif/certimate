@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { IconBrowserShare, IconCertificate, IconDots, IconExternalLink, IconReload, IconShieldCancel, IconTrash } from "@tabler/icons-react";
 import { useMount, useRequest } from "ahooks";
-import { App, Button, Dropdown, Input, Segmented, Skeleton, Table, type TableProps, Typography, theme } from "antd";
+import { App, Button, Dropdown, Input, Segmented, Skeleton, Table, Tooltip, type TableProps, Typography, theme } from "antd";
 import dayjs from "dayjs";
 import { ClientResponseError } from "pocketbase";
 
@@ -11,9 +11,10 @@ import { revoke as revokeCertificate } from "@/api/certificates";
 import CertificateDetailDrawer from "@/components/certificate/CertificateDetailDrawer";
 import Empty from "@/components/Empty";
 import Show from "@/components/Show";
-import { CERTIFICATE_SOURCES, type CertificateModel } from "@/domain/certificate";
+import { CERTIFICATE_REVOCATION_STATUS, CERTIFICATE_SOURCES, type CertificateModel, type CertificateRevocationModel } from "@/domain/certificate";
 import { useAppSettings, useZustandShallowSelector } from "@/hooks";
 import { get as getCertificate, list as listCertificates, remove as removeCertificate } from "@/repository/certificate";
+import { listLatestByCertificateIds } from "@/repository/certificateRevocation";
 import { usePersistenceSettingsStore } from "@/stores/settings";
 import { unwrapErrMsg } from "@/utils/error";
 
@@ -54,6 +55,32 @@ const CertificateList = () => {
   const [tableData, setTableData] = useState<CertificateModel[]>([]);
   const [tableTotal, setTableTotal] = useState<number>(0);
   const [tableSelectedRowKeys, setTableSelectedRowKeys] = useState<string[]>([]);
+  const [revocationMap, setRevocationMap] = useState<Map<string, CertificateRevocationModel>>(new Map());
+
+  // load the latest revocation attempt (if any) for the certificates shown on
+  // the current page; the attempt record is the source of the client-visible
+  // "revocation unknown" state
+  useEffect(() => {
+    if (tableData.length === 0) {
+      setRevocationMap(new Map());
+      return;
+    }
+
+    let cancelled = false;
+    listLatestByCertificateIds(tableData.map((item) => item.id))
+      .then((map) => {
+        if (!cancelled) {
+          setRevocationMap(map);
+        }
+      })
+      .catch((err) => {
+        console.error(err);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [tableData]);
   const tableColumns: TableProps<CertificateModel>["columns"] = [
     {
       key: "subjectName",
@@ -107,9 +134,25 @@ const CertificateList = () => {
         const leftHours = dayjs(record.validityNotAfter).diff(dayjs(), "h");
         const leftDays = Math.round(leftHours / 24);
 
+        const unknownAttempt = revocationMap.get(record.id);
+        const revocationUnknown =
+          !isRevoked && unknownAttempt?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN;
+
         return (
           <div className="flex max-w-full flex-col gap-1 truncate">
-            {!isRevoked && !isExpired ? (
+            {revocationUnknown ? (
+              <Tooltip
+                title={t("certificate.props.revocation_unknown.tip", {
+                  time: dayjs(unknownAttempt!.endedAt || unknownAttempt!.updated || unknownAttempt!.created).format("YYYY-MM-DD HH:mm:ss"),
+                  message: unknownAttempt!.errorMessage || "",
+                })}
+              >
+                <Typography.Text ellipsis type="warning">
+                  <span className="mr-2 inline-block size-2 rounded-full bg-warning leading-2">&nbsp;</span>
+                  {t("certificate.props.revocation_unknown")}
+                </Typography.Text>
+              </Tooltip>
+            ) : !isRevoked && !isExpired ? (
               leftDays >= expiryThreshold ? (
                 <Typography.Text ellipsis type="success">
                   <span className="mr-2 inline-block size-2 rounded-full bg-success leading-2">&nbsp;</span>
@@ -205,7 +248,10 @@ const CertificateList = () => {
               },
               {
                 key: "revoke",
-                label: t("certificate.action.revoke.menu"),
+                label:
+                  revocationMap.get(record.id)?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN && !record.isRevoked
+                    ? t("certificate.action.revoke.unknown.menu")
+                    : t("certificate.action.revoke.menu"),
                 danger: true,
                 disabled: record.source !== CERTIFICATE_SOURCES.REQUEST || record.isRevoked,
                 icon: (
@@ -214,7 +260,11 @@ const CertificateList = () => {
                   </span>
                 ),
                 onClick: () => {
-                  handleRecordRevokeClick(record);
+                  if (revocationMap.get(record.id)?.status === CERTIFICATE_REVOCATION_STATUS.UNKNOWN && !record.isRevoked) {
+                    handleRecordReconfirmRevokeClick(record);
+                  } else {
+                    handleRecordRevokeClick(record);
+                  }
                 },
               },
               {
@@ -356,8 +406,47 @@ const CertificateList = () => {
   const handleRecordDetailClick = (certificate: CertificateModel) => {
     const drawer = detailDrawer.open({ data: certificate, loading: true });
     getCertificate(certificate.id).then((data) => {
-      drawer.safeUpdate({ data, loading: false });
+      const latestAttempt = revocationMap.get(certificate.id);
+      drawer.safeUpdate({
+        data: {
+          ...data,
+          revokeStatus: latestAttempt?.status,
+          revokeErrorMessage: latestAttempt?.errorMessage,
+          revokeEndedAt: latestAttempt?.endedAt || latestAttempt?.updated || latestAttempt?.created,
+        },
+        loading: false,
+      });
     });
+  };
+
+  const doRevokeCertificate = async (certificate: CertificateModel, confirm: boolean) => {
+    try {
+      const resp = await revokeCertificate(certificate.id, confirm);
+      if (resp) {
+        message.success(t("common.text.operation_succeeded"));
+        setTableData((prev) =>
+          prev.map((item) =>
+            item.id === certificate.id
+              ? { ...item, isRevoked: true, revokeStatus: CERTIFICATE_REVOCATION_STATUS.SUCCEEDED }
+              : item
+          )
+        );
+        refreshData();
+      }
+    } catch (err) {
+      console.error(err);
+      if (err instanceof ClientResponseError && err.status === 409) {
+        // the revocation result is unknown; no blind retry happened, refresh
+        // the list so the unknown state becomes visible and diagnosable
+        notification.warning({
+          title: t("certificate.props.revocation_unknown"),
+          description: unwrapErrMsg(err),
+        });
+        refreshData();
+      } else {
+        notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+      }
+    }
   };
 
   const handleRecordRevokeClick = (certificate: CertificateModel) => {
@@ -371,19 +460,22 @@ const CertificateList = () => {
       ),
       okText: t("common.button.confirm"),
       okButtonProps: { danger: true },
-      onOk: async () => {
-        try {
-          const resp = await revokeCertificate(certificate.id);
-          if (resp) {
-            message.success(t("common.text.operation_succeeded"));
-            setTableData((prev) => prev.map((item) => (item.id === certificate.id ? { ...item, isRevoked: true } : item)));
-            refreshData();
-          }
-        } catch (err) {
-          console.error(err);
-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
-        }
-      },
+      onOk: () => doRevokeCertificate(certificate, false),
+    });
+  };
+
+  const handleRecordReconfirmRevokeClick = (certificate: CertificateModel) => {
+    modal.confirm({
+      title: <span className="text-warning">{t("certificate.action.revoke.unknown.modal.title", { name: certificate.subjectAltNames })}</span>,
+      content: <span dangerouslySetInnerHTML={{ __html: t("certificate.action.revoke.unknown.modal.content") }} />,
+      icon: (
+        <span className="anticon" role="img">
+          <IconShieldCancel className="text-warning" size="1em" />
+        </span>
+      ),
+      okText: t("common.button.confirm"),
+      okButtonProps: { danger: true },
+      onOk: () => doRevokeCertificate(certificate, true),
     });
   };
 

@@ -20,6 +20,12 @@ type CertificateDownloadResp struct {
 
 type CertificateRevokeReq struct {
 	CertificateId string `json:"-"`
+	// Confirm explicitly reconfirms that a new revocation attempt may be
+	// started when the latest attempt ended in an unknown state.
+	Confirm bool `json:"confirm,omitempty"`
 }
 
-type CertificateRevokeResp struct{}
+type CertificateRevokeResp struct {
+	AttemptId string `json:"attemptId,omitempty"`
+	Status    string `json:"status,omitempty"`
+}

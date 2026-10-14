@@ -19,6 +19,7 @@ export const getPocketBase = () => {
 export const COLLECTION_NAME_ADMIN = "_superusers";
 export const COLLECTION_NAME_ACCESS = "access";
 export const COLLECTION_NAME_CERTIFICATE = "certificate";
+export const COLLECTION_NAME_CERTIFICATE_REVOCATION = "certificate_revocation";
 export const COLLECTION_NAME_SETTINGS = "settings";
 export const COLLECTION_NAME_WORKFLOW = "workflow";
 export const COLLECTION_NAME_WORKFLOW_RUN = "workflow_run";
