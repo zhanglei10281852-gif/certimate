@@ -198,6 +198,13 @@
       "uncompleted_design": {
         "alert": "The orchestration is not ready. Please check if there are any nodes not configured."
       },
+      "conflict": {
+        "modal": {
+          "title": "Workflow updated by another administrator",
+          "content": "The draft or published version has been changed by someone else. Your local changes can no longer be saved or published and will not overwrite the newer version. The page will reload so you can continue editing on the latest version.",
+          "ok_button": "Reload now"
+        }
+      },
       "unpublished_draft": {
         "alert": "The orchestration is not released yet."
       },

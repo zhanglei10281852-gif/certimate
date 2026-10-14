@@ -14,6 +14,10 @@ export interface WorkflowModel extends BaseModel {
   graphContent?: WorkflowGraph;
   hasDraft?: boolean;
   hasContent?: boolean;
+  /** 草稿代际：每次草稿保存/发布/回滚由服务端推进，写入时必须回传所基于的值 */
+  draftVersion?: number;
+  /** 已发布代际：每次发布成功由服务端推进 */
+  contentVersion?: number;
   lastRunRef?: string;
   lastRunStatus?: string;
   lastRunTime?: string;

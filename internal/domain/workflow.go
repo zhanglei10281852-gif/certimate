@@ -22,9 +22,14 @@ type Workflow struct {
 	GraphContent  *WorkflowGraph        `db:"graphContent"  json:"graphContent"`
 	HasDraft      bool                  `db:"hasDraft"      json:"hasDraft"`
 	HasContent    bool                  `db:"hasContent"    json:"hasContent"`
-	LastRunId     string                `db:"lastRunRef"    json:"lastRunId"`
-	LastRunStatus WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
-	LastRunTime   time.Time             `db:"lastRunTime"   json:"lastRunTime"`
+	// DraftVersion 是 graphDraft 的代际，仅在保存草稿/发布/回滚成功时推进。
+	// 客户端的每一次草稿写入都必须基于它实际读取到的 DraftVersion。
+	DraftVersion int `db:"draftVersion" json:"draftVersion"`
+	// ContentVersion 是 graphContent（已发布快照）的代际，仅在发布成功时推进。
+	ContentVersion int                  `db:"contentVersion" json:"contentVersion"`
+	LastRunId      string                `db:"lastRunRef"    json:"lastRunId"`
+	LastRunStatus  WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
+	LastRunTime    time.Time             `db:"lastRunTime"   json:"lastRunTime"`
 }
 
 type WorkflowGraph struct {
@@ -67,6 +72,34 @@ func (g *WorkflowGraph) Clone() *WorkflowGraph {
 	return &WorkflowGraph{
 		Nodes: g.Nodes,
 	}
+}
+
+// TriggerSettings 从开始节点中读取该编排对应的触发方式与定时表达式。
+// 发布时以服务端持久化草稿中的开始节点为准，从而保证图、触发方式与定时表达式来自同一份快照。
+func (g *WorkflowGraph) TriggerSettings() (WorkflowTriggerType, string, error) {
+	if len(g.Nodes) == 0 || g.Nodes[0] == nil {
+		return "", "", fmt.Errorf("the start node is missing")
+	}
+
+	startNode := g.Nodes[0]
+	if startNode.Type != WorkflowNodeTypeStart {
+		return "", "", fmt.Errorf("the first node is not a start node")
+	}
+
+	trigger := WorkflowTriggerType(xmaps.GetString(startNode.Data.Config, "trigger"))
+	if trigger == "" {
+		trigger = WorkflowTriggerTypeManual
+	}
+	if trigger != WorkflowTriggerTypeManual && trigger != WorkflowTriggerTypeScheduled {
+		return "", "", fmt.Errorf("invalid trigger type: %s", trigger)
+	}
+
+	triggerCron := xmaps.GetString(startNode.Data.Config, "triggerCron")
+	if trigger == WorkflowTriggerTypeManual {
+		triggerCron = ""
+	}
+
+	return trigger, triggerCron, nil
 }
 
 type WorkflowTriggerType string

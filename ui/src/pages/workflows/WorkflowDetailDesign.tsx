@@ -12,7 +12,7 @@ import WorkflowGraphExportModal from "@/components/workflow/WorkflowGraphExportM
 import WorkflowGraphImportModal from "@/components/workflow/WorkflowGraphImportModal";
 import { useAppSettings, useZustandShallowSelector } from "@/hooks";
 import { useWorkflowStore } from "@/stores/workflow";
-import { unwrapErrMsg } from "@/utils/error";
+import { isWorkflowVersionConflictError, unwrapErrMsg } from "@/utils/error";
 
 const WorkflowDetailDesign = () => {
   const { t } = useTranslation();
@@ -29,7 +29,34 @@ const WorkflowDetailDesign = () => {
 
   const designerRef = useRef<WorkflowDesignerInstance>(null);
   const designerPending = useRef(false); // 保存中时阻止刷新画布
+  // 检测到他人已推进版本后置位：不再自动保存/重试，仅允许用户重新加载后继续编辑
+  const versionConflictRef = useRef(false);
   const [designerError, setDesignerError] = useState<unknown>();
+
+  const showVersionConflictModal = () => {
+    modal.warning({
+      title: t("workflow.detail.design.conflict.modal.title"),
+      content: t("workflow.detail.design.conflict.modal.content"),
+      okText: t("workflow.detail.design.conflict.modal.ok_button"),
+      cancelButtonProps: { style: { display: "none" } },
+      onOk: () => {
+        window.location.reload();
+      },
+    });
+  };
+
+  // 冲突错误：明确提示并引导刷新，保留服务端新草稿/已发布内容，不做静默合并或重试覆盖
+  const handleActionError = (err: unknown) => {
+    console.error(err);
+    if (isWorkflowVersionConflictError(err)) {
+      versionConflictRef.current = true;
+      showVersionConflictModal();
+      return;
+    }
+
+    notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+  };
+
   useDeepCompareEffect(() => {
     if (designerRef.current == null || designerRef.current.document.disposed) return;
     if (designerPending.current) return;
@@ -48,20 +75,25 @@ const WorkflowDetailDesign = () => {
 
   const handleDesignerDocumentChange = debounce({ delay: 300 }, async () => {
     if (designerRef.current == null || designerRef.current.document.disposed) return;
+    if (versionConflictRef.current) return;
 
     designerPending.current = true;
     try {
       const graph = designerRef.current!.document.toJSON();
       await workflowStore.orchestrate(graph);
     } catch (err) {
-      console.error(err);
-      notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+      handleActionError(err);
     } finally {
       designerPending.current = false;
     }
   });
 
   const handleRollbackClick = () => {
+    if (versionConflictRef.current) {
+      showVersionConflictModal();
+      return;
+    }
+
     modal.confirm({
       title: t("workflow.detail.design.action.rollback.modal.title"),
       content: t("workflow.detail.design.action.rollback.modal.content"),
@@ -71,14 +103,18 @@ const WorkflowDetailDesign = () => {
 
           message.success(t("common.text.operation_succeeded"));
         } catch (err) {
-          console.error(err);
-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+          handleActionError(err);
         }
       },
     });
   };
 
   const handlePublishClick = async () => {
+    if (versionConflictRef.current) {
+      showVersionConflictModal();
+      return;
+    }
+
     if (!(await designerRef.current!.validateAllNodes())) {
       message.warning(t("workflow.detail.design.uncompleted_design.alert"));
       return;
@@ -93,8 +129,7 @@ const WorkflowDetailDesign = () => {
 
           message.success(t("common.text.operation_succeeded"));
         } catch (err) {
-          console.error(err);
-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+          handleActionError(err);
         }
       },
     });
@@ -104,6 +139,11 @@ const WorkflowDetailDesign = () => {
   const { modalProps: graphExportModalProps, ...graphExportModal } = WorkflowGraphExportModal.useModal();
 
   const handleImportClick = async () => {
+    if (versionConflictRef.current) {
+      showVersionConflictModal();
+      return;
+    }
+
     graphImportModal.open().then(async (graph) => {
       const loadingKey = Math.random().toString(36).substring(0, 8);
       message.loading({ key: loadingKey, content: t("common.text.saving"), duration: 0 });
@@ -114,9 +154,8 @@ const WorkflowDetailDesign = () => {
         message.destroy(loadingKey);
         message.success(t("common.text.operation_succeeded"));
       } catch (err) {
-        console.error(err);
         message.destroy(loadingKey);
-        notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
+        handleActionError(err);
       }
     });
   };

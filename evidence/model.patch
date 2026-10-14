@@ -1,0 +1,1097 @@
+diff --git a/internal/domain/dtos/workflow.go b/internal/domain/dtos/workflow.go
+index 7e07295d..2480b40d 100644
+--- a/internal/domain/dtos/workflow.go
++++ b/internal/domain/dtos/workflow.go
+@@ -25,3 +25,23 @@ type WorkflowStatisticsResp struct {
+ 	PendingRunIds    []string `json:"pendingRunIds"`
+ 	ProcessingRunIds []string `json:"processingRunIds"`
+ }
++
++// WorkflowSaveDraftReq 仅推进 BaseDraftVersion 所指向的草稿代际。
++type WorkflowSaveDraftReq struct {
++	WorkflowId       string                `json:"-"`
++	Graph            *domain.WorkflowGraph `json:"graph"`
++	BaseDraftVersion int                   `json:"baseDraftVersion"`
++}
++
++// WorkflowPublishDraftReq 要求服务端当前草稿代际仍等于 BaseDraftVersion，
++// 然后把该草稿（图、触发方式、定时表达式）作为同一个已发布代原子提交。
++type WorkflowPublishDraftReq struct {
++	WorkflowId       string `json:"-"`
++	BaseDraftVersion int    `json:"baseDraftVersion"`
++}
++
++// WorkflowRollbackDraftReq 用当前已发布内容重置草稿，要求草稿代际仍等于 BaseDraftVersion。
++type WorkflowRollbackDraftReq struct {
++	WorkflowId       string `json:"-"`
++	BaseDraftVersion int    `json:"baseDraftVersion"`
++}
+diff --git a/internal/domain/error.go b/internal/domain/error.go
+index 39dd64b9..e79fd53a 100644
+--- a/internal/domain/error.go
++++ b/internal/domain/error.go
+@@ -3,6 +3,11 @@ package domain
+ var (
+ 	ErrInvalidParams  = NewError(400, "invalid params")
+ 	ErrRecordNotFound = NewError(404, "record not found")
++	// ErrWorkflowVersionConflict 表示客户端所基于的草稿代际已落后于服务端持久版本。
++	// 冲突时不做静默合并或重试覆盖，由客户端提示后重新加载。
++	ErrWorkflowVersionConflict = NewError(409, "workflow version conflict: the workflow has been modified by another user, please reload and try again")
++	// ErrWorkflowNotPublished 表示工作流尚不存在已发布快照（无法回滚或发布空草稿等）。
++	ErrWorkflowNotPublished = NewError(400, "workflow has no published content")
+ )
+ 
+ type Error struct {
+diff --git a/internal/domain/workflow.go b/internal/domain/workflow.go
+index c5e6f7b7..7f2fcd02 100644
+--- a/internal/domain/workflow.go
++++ b/internal/domain/workflow.go
+@@ -22,9 +22,14 @@ type Workflow struct {
+ 	GraphContent  *WorkflowGraph        `db:"graphContent"  json:"graphContent"`
+ 	HasDraft      bool                  `db:"hasDraft"      json:"hasDraft"`
+ 	HasContent    bool                  `db:"hasContent"    json:"hasContent"`
+-	LastRunId     string                `db:"lastRunRef"    json:"lastRunId"`
+-	LastRunStatus WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
+-	LastRunTime   time.Time             `db:"lastRunTime"   json:"lastRunTime"`
++	// DraftVersion 是 graphDraft 的代际，仅在保存草稿/发布/回滚成功时推进。
++	// 客户端的每一次草稿写入都必须基于它实际读取到的 DraftVersion。
++	DraftVersion int `db:"draftVersion" json:"draftVersion"`
++	// ContentVersion 是 graphContent（已发布快照）的代际，仅在发布成功时推进。
++	ContentVersion int                  `db:"contentVersion" json:"contentVersion"`
++	LastRunId      string                `db:"lastRunRef"    json:"lastRunId"`
++	LastRunStatus  WorkflowRunStatusType `db:"lastRunStatus" json:"lastRunStatus"`
++	LastRunTime    time.Time             `db:"lastRunTime"   json:"lastRunTime"`
+ }
+ 
+ type WorkflowGraph struct {
+@@ -69,6 +74,34 @@ func (g *WorkflowGraph) Clone() *WorkflowGraph {
+ 	}
+ }
+ 
++// TriggerSettings 从开始节点中读取该编排对应的触发方式与定时表达式。
++// 发布时以服务端持久化草稿中的开始节点为准，从而保证图、触发方式与定时表达式来自同一份快照。
++func (g *WorkflowGraph) TriggerSettings() (WorkflowTriggerType, string, error) {
++	if len(g.Nodes) == 0 || g.Nodes[0] == nil {
++		return "", "", fmt.Errorf("the start node is missing")
++	}
++
++	startNode := g.Nodes[0]
++	if startNode.Type != WorkflowNodeTypeStart {
++		return "", "", fmt.Errorf("the first node is not a start node")
++	}
++
++	trigger := WorkflowTriggerType(xmaps.GetString(startNode.Data.Config, "trigger"))
++	if trigger == "" {
++		trigger = WorkflowTriggerTypeManual
++	}
++	if trigger != WorkflowTriggerTypeManual && trigger != WorkflowTriggerTypeScheduled {
++		return "", "", fmt.Errorf("invalid trigger type: %s", trigger)
++	}
++
++	triggerCron := xmaps.GetString(startNode.Data.Config, "triggerCron")
++	if trigger == WorkflowTriggerTypeManual {
++		triggerCron = ""
++	}
++
++	return trigger, triggerCron, nil
++}
++
+ type WorkflowTriggerType string
+ 
+ func (t WorkflowTriggerType) String() string {
+diff --git a/internal/repository/workflow.go b/internal/repository/workflow.go
+index 45458cda..74d0955b 100644
+--- a/internal/repository/workflow.go
++++ b/internal/repository/workflow.go
+@@ -5,11 +5,14 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
++	"reflect"
+ 
+-	"github.com/certimate-go/certimate/internal/app"
+-	"github.com/certimate-go/certimate/internal/domain"
+ 	"github.com/pocketbase/dbx"
+ 	"github.com/pocketbase/pocketbase/core"
++	pbcron "github.com/pocketbase/pocketbase/tools/cron"
++
++	"github.com/certimate-go/certimate/internal/app"
++	"github.com/certimate-go/certimate/internal/domain"
+ )
+ 
+ type WorkflowRepository struct{}
+@@ -83,6 +86,8 @@ func (r *WorkflowRepository) Save(ctx context.Context, workflow *domain.Workflow
+ 	record.Set("graphContent", workflow.GraphContent)
+ 	record.Set("hasDraft", workflow.HasDraft)
+ 	record.Set("hasContent", workflow.HasContent)
++	record.Set("draftVersion", workflow.DraftVersion)
++	record.Set("contentVersion", workflow.ContentVersion)
+ 	record.Set("lastRunRef", workflow.LastRunId)
+ 	record.Set("lastRunStatus", workflow.LastRunStatus.String())
+ 	record.Set("lastRunTime", workflow.LastRunTime)
+@@ -96,6 +101,215 @@ func (r *WorkflowRepository) Save(ctx context.Context, workflow *domain.Workflow
+ 	return workflow, nil
+ }
+ 
++// SaveDraft 保存草稿，只能推进 baseDraftVersion 所指向的草稿代际。
++// 若内容与服务端当前草稿完全一致则不落库、不推进代际；否则在同一事务内推进 draftVersion。
++func (r *WorkflowRepository) SaveDraft(ctx context.Context, workflowId string, graph *domain.WorkflowGraph, baseDraftVersion int) (*domain.Workflow, error) {
++	if graph == nil {
++		return nil, domain.ErrInvalidParams
++	}
++
++	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameWorkflow)
++	if err != nil {
++		return nil, err
++	}
++
++	var workflow *domain.Workflow
++	err = app.GetApp().RunInTransaction(func(txApp core.App) error {
++		record, err := r.claimDraftGeneration(txApp, collection, workflowId, baseDraftVersion)
++		if err != nil {
++			return err
++		}
++
++		currentDraft := &domain.WorkflowGraph{}
++		if err := record.UnmarshalJSONField("graphDraft", currentDraft); err != nil {
++			return fmt.Errorf("field 'graphDraft' is malformed: %w", err)
++		}
++
++		// 以已发布内容为基准计算是否仍存在未发布更改；从未发布过时一定存在草稿
++		hasDraft := true
++		if record.GetBool("hasContent") {
++			currentContent := &domain.WorkflowGraph{}
++			if err := record.UnmarshalJSONField("graphContent", currentContent); err != nil {
++				return fmt.Errorf("field 'graphContent' is malformed: %w", err)
++			}
++			hasDraft = !reflect.DeepEqual(currentContent, graph)
++		}
++
++		// 幂等：草稿内容与 hasDraft 均未变化时直接返回当前版本，不推进代际
++		if reflect.DeepEqual(currentDraft, graph) && record.GetBool("hasDraft") == hasDraft {
++			workflow, err = r.castRecordToModel(record)
++			return err
++		}
++
++		record.Set("graphDraft", graph)
++		record.Set("hasDraft", hasDraft)
++		record.Set("draftVersion", baseDraftVersion+1)
++		if err := txApp.Save(record); err != nil {
++			return err
++		}
++
++		workflow, err = r.castRecordToModel(record)
++		return err
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return workflow, nil
++}
++
++// PublishDraft 原子发布：要求当前草稿代际仍等于 baseDraftVersion，
++// 校验通过后把图、触发方式、定时表达式作为同一个已发布代提交，同时推进 draftVersion 与 contentVersion。
++// 校验失败时事务回滚，服务端既有草稿与已发布内容均保持不变。
++func (r *WorkflowRepository) PublishDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error) {
++	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameWorkflow)
++	if err != nil {
++		return nil, err
++	}
++
++	var workflow *domain.Workflow
++	err = app.GetApp().RunInTransaction(func(txApp core.App) error {
++		record, err := r.claimDraftGeneration(txApp, collection, workflowId, baseDraftVersion)
++		if err != nil {
++			return err
++		}
++
++		draft := &domain.WorkflowGraph{}
++		if err := record.UnmarshalJSONField("graphDraft", draft); err != nil {
++			return fmt.Errorf("field 'graphDraft' is malformed: %w", err)
++		}
++		if len(draft.Nodes) == 0 {
++			return domain.NewError(400, "workflow graph draft is empty")
++		}
++		if err := draft.Verify(); err != nil {
++			return domain.NewError(400, fmt.Sprintf("workflow graph draft is invalid: %s", err.Error()))
++		}
++
++		trigger, triggerCron, err := draft.TriggerSettings()
++		if err != nil {
++			return domain.NewError(400, err.Error())
++		}
++		if trigger == domain.WorkflowTriggerTypeScheduled {
++			if triggerCron == "" {
++				return domain.NewError(400, "trigger cron expression is required for scheduled workflow")
++			}
++			if _, err := pbcron.NewSchedule(triggerCron); err != nil {
++				return domain.NewError(400, fmt.Sprintf("invalid trigger cron expression: %s", err.Error()))
++			}
++		}
++
++		// 图、触发方式、定时表达式在同一事务中一起成为新的已发布代
++		record.Set("graphContent", record.GetRaw("graphDraft"))
++		record.Set("trigger", trigger.String())
++		record.Set("triggerCron", triggerCron)
++		record.Set("hasContent", true)
++		record.Set("hasDraft", false)
++		record.Set("draftVersion", baseDraftVersion+1)
++		record.Set("contentVersion", record.GetInt("contentVersion")+1)
++		if err := txApp.Save(record); err != nil {
++			return err
++		}
++
++		workflow, err = r.castRecordToModel(record)
++		return err
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return workflow, nil
++}
++
++// RollbackDraft 用当前已发布内容重置草稿，要求草稿代际仍等于 baseDraftVersion，
++// 以避免用陈旧页面丢弃他人新保存的草稿或新发布的内容。
++func (r *WorkflowRepository) RollbackDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error) {
++	collection, err := app.GetApp().FindCollectionByNameOrId(domain.CollectionNameWorkflow)
++	if err != nil {
++		return nil, err
++	}
++
++	var workflow *domain.Workflow
++	err = app.GetApp().RunInTransaction(func(txApp core.App) error {
++		record, err := r.claimDraftGeneration(txApp, collection, workflowId, baseDraftVersion)
++		if err != nil {
++			return err
++		}
++
++		if !record.GetBool("hasContent") {
++			return domain.ErrWorkflowNotPublished
++		}
++
++		content := &domain.WorkflowGraph{}
++		if err := record.UnmarshalJSONField("graphContent", content); err != nil {
++			return fmt.Errorf("field 'graphContent' is malformed: %w", err)
++		}
++		if len(content.Nodes) == 0 {
++			return domain.NewError(400, "workflow graph content is empty")
++		}
++
++		trigger, triggerCron, err := content.TriggerSettings()
++		if err != nil {
++			return domain.NewError(400, err.Error())
++		}
++		if trigger == domain.WorkflowTriggerTypeScheduled {
++			if _, err := pbcron.NewSchedule(triggerCron); err != nil {
++				return domain.NewError(400, fmt.Sprintf("invalid trigger cron expression: %s", err.Error()))
++			}
++		}
++
++		record.Set("graphDraft", record.GetRaw("graphContent"))
++		record.Set("trigger", trigger.String())
++		record.Set("triggerCron", triggerCron)
++		record.Set("hasDraft", false)
++		record.Set("draftVersion", baseDraftVersion+1)
++		if err := txApp.Save(record); err != nil {
++			return err
++		}
++
++		workflow, err = r.castRecordToModel(record)
++		return err
++	})
++	if err != nil {
++		return nil, err
++	}
++
++	return workflow, nil
++}
++
++// claimDraftGeneration 在事务内以条件 UPDATE 占用并校验草稿代际。
++// 它必须是事务中的首个写操作：WHERE draftVersion = baseDraftVersion 使得版本校验与写锁获取原子完成，
++// 并发提交时落后的一方会得到 0 行受影响，从而返回 ErrWorkflowVersionConflict 而不会覆盖新内容。
++func (r *WorkflowRepository) claimDraftGeneration(txApp core.App, collection *core.Collection, workflowId string, baseDraftVersion int) (*core.Record, error) {
++	result, err := txApp.DB().
++		NewQuery(fmt.Sprintf(
++			"UPDATE %s SET draftVersion = draftVersion WHERE id = {:id} AND draftVersion = {:baseDraftVersion}",
++			domain.CollectionNameWorkflow,
++		)).
++		Bind(dbx.Params{"id": workflowId, "baseDraftVersion": baseDraftVersion}).
++		Execute()
++	if err != nil {
++		return nil, err
++	}
++
++	record, findErr := txApp.FindRecordById(collection, workflowId)
++	if findErr != nil {
++		if errors.Is(findErr, sql.ErrNoRows) {
++			return nil, domain.ErrRecordNotFound
++		}
++		return nil, findErr
++	}
++
++	affected, err := result.RowsAffected()
++	if err != nil {
++		return nil, err
++	}
++	if affected == 0 {
++		return nil, domain.ErrWorkflowVersionConflict
++	}
++
++	return record, nil
++}
++
+ func (r *WorkflowRepository) castRecordToModel(record *core.Record) (*domain.Workflow, error) {
+ 	if record == nil {
+ 		return nil, fmt.Errorf("the record is nil")
+@@ -117,18 +331,20 @@ func (r *WorkflowRepository) castRecordToModel(record *core.Record) (*domain.Wor
+ 			CreatedAt: record.GetDateTime("created").Time(),
+ 			UpdatedAt: record.GetDateTime("updated").Time(),
+ 		},
+-		Name:          record.GetString("name"),
+-		Description:   record.GetString("description"),
+-		Trigger:       domain.WorkflowTriggerType(record.GetString("trigger")),
+-		TriggerCron:   record.GetString("triggerCron"),
+-		Enabled:       record.GetBool("enabled"),
+-		GraphDraft:    graphDraft,
+-		GraphContent:  graphContent,
+-		HasDraft:      record.GetBool("hasDraft"),
+-		HasContent:    record.GetBool("hasContent"),
+-		LastRunId:     record.GetString("lastRunRef"),
+-		LastRunStatus: domain.WorkflowRunStatusType(record.GetString("lastRunStatus")),
+-		LastRunTime:   record.GetDateTime("lastRunTime").Time(),
++		Name:           record.GetString("name"),
++		Description:    record.GetString("description"),
++		Trigger:        domain.WorkflowTriggerType(record.GetString("trigger")),
++		TriggerCron:    record.GetString("triggerCron"),
++		Enabled:        record.GetBool("enabled"),
++		GraphDraft:     graphDraft,
++		GraphContent:   graphContent,
++		HasDraft:       record.GetBool("hasDraft"),
++		HasContent:     record.GetBool("hasContent"),
++		DraftVersion:   record.GetInt("draftVersion"),
++		ContentVersion: record.GetInt("contentVersion"),
++		LastRunId:      record.GetString("lastRunRef"),
++		LastRunStatus:  domain.WorkflowRunStatusType(record.GetString("lastRunStatus")),
++		LastRunTime:    record.GetDateTime("lastRunTime").Time(),
+ 	}
+ 	return workflow, nil
+ }
+diff --git a/internal/rest/handlers/workflows.go b/internal/rest/handlers/workflows.go
+index 472eeded..2c9e62ef 100644
+--- a/internal/rest/handlers/workflows.go
++++ b/internal/rest/handlers/workflows.go
+@@ -16,6 +16,9 @@ type workflowService interface {
+ 	GetStatistics(ctx context.Context) (*dtos.WorkflowStatisticsResp, error)
+ 	StartRun(ctx context.Context, req *dtos.WorkflowStartRunReq) (*dtos.WorkflowStartRunResp, error)
+ 	CancelRun(ctx context.Context, req *dtos.WorkflowCancelRunReq) (*dtos.WorkflowCancelRunResp, error)
++	SaveDraft(ctx context.Context, req *dtos.WorkflowSaveDraftReq) (*domain.Workflow, error)
++	PublishDraft(ctx context.Context, req *dtos.WorkflowPublishDraftReq) (*domain.Workflow, error)
++	RollbackDraft(ctx context.Context, req *dtos.WorkflowRollbackDraftReq) (*domain.Workflow, error)
+ 	Shutdown(ctx context.Context)
+ }
+ 
+@@ -30,6 +33,9 @@ func NewWorkflowsHandler(router *router.RouterGroup[*core.RequestEvent], service
+ 
+ 	group := router.Group("/workflows")
+ 	group.GET("/stats", handler.getStatistics)
++	group.POST("/{workflowId}/draft", handler.saveDraft)
++	group.POST("/{workflowId}/publish", handler.publishDraft)
++	group.POST("/{workflowId}/rollback", handler.rollbackDraft)
+ 	group.POST("/{workflowId}/runs", handler.startRun)
+ 	group.POST("/{workflowId}/runs/{runId}/cancel", handler.cancelRun)
+ }
+@@ -43,6 +49,51 @@ func (handler *WorkflowsHandler) getStatistics(e *core.RequestEvent) error {
+ 	return resp.Ok(e, res)
+ }
+ 
++func (handler *WorkflowsHandler) saveDraft(e *core.RequestEvent) error {
++	req := &dtos.WorkflowSaveDraftReq{}
++	req.WorkflowId = e.Request.PathValue("workflowId")
++	if err := e.BindBody(req); err != nil {
++		return resp.Err(e, err)
++	}
++
++	res, err := handler.service.SaveDraft(e.Request.Context(), req)
++	if err != nil {
++		return resp.Err(e, err)
++	}
++
++	return resp.Ok(e, res)
++}
++
++func (handler *WorkflowsHandler) publishDraft(e *core.RequestEvent) error {
++	req := &dtos.WorkflowPublishDraftReq{}
++	req.WorkflowId = e.Request.PathValue("workflowId")
++	if err := e.BindBody(req); err != nil {
++		return resp.Err(e, err)
++	}
++
++	res, err := handler.service.PublishDraft(e.Request.Context(), req)
++	if err != nil {
++		return resp.Err(e, err)
++	}
++
++	return resp.Ok(e, res)
++}
++
++func (handler *WorkflowsHandler) rollbackDraft(e *core.RequestEvent) error {
++	req := &dtos.WorkflowRollbackDraftReq{}
++	req.WorkflowId = e.Request.PathValue("workflowId")
++	if err := e.BindBody(req); err != nil {
++		return resp.Err(e, err)
++	}
++
++	res, err := handler.service.RollbackDraft(e.Request.Context(), req)
++	if err != nil {
++		return resp.Err(e, err)
++	}
++
++	return resp.Ok(e, res)
++}
++
+ func (handler *WorkflowsHandler) startRun(e *core.RequestEvent) error {
+ 	req := &dtos.WorkflowStartRunReq{}
+ 	req.WorkflowId = e.Request.PathValue("workflowId")
+diff --git a/internal/workflow/pbhook.go b/internal/workflow/pbhook.go
+index 8fd6919b..e8ff7cab 100644
+--- a/internal/workflow/pbhook.go
++++ b/internal/workflow/pbhook.go
+@@ -2,13 +2,29 @@ package workflow
+ 
+ import (
+ 	"context"
++	"net/http"
++	"strings"
+ 
++	"github.com/pocketbase/pocketbase/apis"
+ 	"github.com/pocketbase/pocketbase/core"
+ 
+ 	"github.com/certimate-go/certimate/internal/app"
+ 	"github.com/certimate-go/certimate/internal/domain"
+ )
+ 
++// workflowVersionGuardedFields 只能通过带代际校验的专用接口（草稿保存/发布/回滚）修改，
++// 禁止通过通用记录更新接口直接写入，否则陈旧页面或手工请求会绕过乐观并发控制。
++var workflowVersionGuardedFields = map[string]struct{}{
++	"trigger":        {},
++	"triggerCron":    {},
++	"graphDraft":     {},
++	"graphContent":   {},
++	"hasDraft":       {},
++	"hasContent":     {},
++	"draftVersion":   {},
++	"contentVersion": {},
++}
++
+ func registerWorkflowRecordEvents() {
+ 	pb := app.GetApp()
+ 	pb.OnRecordCreateRequest(domain.CollectionNameWorkflow).BindFunc(func(e *core.RecordRequestEvent) error {
+@@ -24,6 +40,11 @@ func registerWorkflowRecordEvents() {
+ 		return nil
+ 	})
+ 	pb.OnRecordUpdateRequest(domain.CollectionNameWorkflow).BindFunc(func(e *core.RecordRequestEvent) error {
++		// 在通用更新接口落库前拦截受保护字段：编排内容只能走 /api/workflows/:id/{draft,publish,rollback}
++		if err := guardWorkflowVersionedFields(e); err != nil {
++			return err
++		}
++
+ 		if err := e.Next(); err != nil {
+ 			return err
+ 		}
+@@ -49,6 +70,29 @@ func registerWorkflowRecordEvents() {
+ 	})
+ }
+ 
++// guardWorkflowVersionedFields 检查通用记录更新请求是否携带了受保护字段，
++// 包括 PocketBase 的 +/- 修饰写法（如 graphDraft+）。命中时返回可识别的冲突结果且不落库。
++func guardWorkflowVersionedFields(e *core.RecordRequestEvent) error {
++	info, err := e.RequestInfo()
++	if err != nil {
++		return apis.NewBadRequestError("Failed to read request data.", err)
++	}
++
++	for key := range info.Body {
++		normalized := strings.TrimLeft(key, "+")
++		normalized = strings.TrimRight(normalized, "+-")
++		if _, ok := workflowVersionGuardedFields[normalized]; ok {
++			return apis.NewApiError(
++				http.StatusConflict,
++				"workflow version conflict: the workflow graph, trigger and their versions can only be modified through the versioned draft/publish/rollback APIs, please reload and try again",
++				map[string]any{"code": "WORKFLOW_VERSION_CONFLICT", "field": normalized},
++			)
++		}
++	}
++
++	return nil
++}
++
+ func onWorkflowRecordCreateOrUpdate(_ context.Context, _ core.App, record *core.Record) error {
+ 	scheduler := app.GetScheduler()
+ 
+diff --git a/internal/workflow/service.go b/internal/workflow/service.go
+index 16ea7e62..88eed847 100644
+--- a/internal/workflow/service.go
++++ b/internal/workflow/service.go
+@@ -130,6 +130,76 @@ func (s *WorkflowService) CancelRun(ctx context.Context, req *dtos.WorkflowCance
+ 	return &dtos.WorkflowCancelRunResp{}, nil
+ }
+ 
++// SaveDraft 基于客户端读取到的草稿代际保存草稿。
++// 版本冲突时透传 ErrWorkflowVersionConflict，不做静默合并或服务端重试。
++func (s *WorkflowService) SaveDraft(ctx context.Context, req *dtos.WorkflowSaveDraftReq) (*domain.Workflow, error) {
++	if req.Graph == nil {
++		return nil, domain.ErrInvalidParams
++	}
++	if req.BaseDraftVersion < 0 {
++		return nil, domain.ErrInvalidParams
++	}
++
++	workflow, err := s.workflowRepo.SaveDraft(ctx, req.WorkflowId, req.Graph, req.BaseDraftVersion)
++	if err != nil {
++		return nil, err
++	}
++
++	return workflow, nil
++}
++
++// PublishDraft 原子发布对应草稿代：校验草稿版本、图与触发配置，
++// 成功提交后才把新的触发方式/定时表达式同步到定时调度；失败时调度与新运行仍使用上一份完整发布版本。
++func (s *WorkflowService) PublishDraft(ctx context.Context, req *dtos.WorkflowPublishDraftReq) (*domain.Workflow, error) {
++	if req.BaseDraftVersion < 0 {
++		return nil, domain.ErrInvalidParams
++	}
++
++	workflow, err := s.workflowRepo.PublishDraft(ctx, req.WorkflowId, req.BaseDraftVersion)
++	if err != nil {
++		return nil, err
++	}
++
++	// 仅在事务提交成功后切换定时任务，保证不会出现"新调度 + 旧快照"的中间状态
++	s.syncSchedule(workflow)
++
++	return workflow, nil
++}
++
++// RollbackDraft 基于客户端读取到的草稿代际回滚到当前已发布内容。
++func (s *WorkflowService) RollbackDraft(ctx context.Context, req *dtos.WorkflowRollbackDraftReq) (*domain.Workflow, error) {
++	if req.BaseDraftVersion < 0 {
++		return nil, domain.ErrInvalidParams
++	}
++
++	workflow, err := s.workflowRepo.RollbackDraft(ctx, req.WorkflowId, req.BaseDraftVersion)
++	if err != nil {
++		return nil, err
++	}
++
++	s.syncSchedule(workflow)
++
++	return workflow, nil
++}
++
++// syncSchedule 依据已提交的持久状态重建该工作流的定时任务：
++// 停用或手动触发时移除任务，启用且定时触发时按最新表达式（重新）注册。
++func (s *WorkflowService) syncSchedule(workflow *domain.Workflow) {
++	scheduler := app.GetScheduler()
++	jobKey := buildPbJobKey(workflow.Id)
++
++	if !workflow.Enabled || workflow.Trigger != domain.WorkflowTriggerTypeScheduled {
++		scheduler.Remove(jobKey)
++		return
++	}
++
++	if err := registerWorkflowJob(s, workflow.Id, workflow.TriggerCron); err != nil {
++		// 表达式已在发布事务中校验通过，此处失败只可能是暂时故障；
++		// 重启时 InitSchedule 会依据持久状态重建任务，不影响已提交快照的完整性。
++		app.GetLogger().Error(fmt.Sprintf("failed to sync cron job after workflow #%s commit", workflow.Id), slog.Any("error", err))
++	}
++}
++
+ func (s *WorkflowService) Shutdown(ctx context.Context) {
+ 	s.dispatcher.Shutdown(ctx)
+ }
+diff --git a/internal/workflow/service_deps.go b/internal/workflow/service_deps.go
+index 89481b91..ad7759ac 100644
+--- a/internal/workflow/service_deps.go
++++ b/internal/workflow/service_deps.go
+@@ -12,6 +12,9 @@ type workflowRepository interface {
+ 	ListEnabledScheduled(ctx context.Context) ([]*domain.Workflow, error)
+ 	GetById(ctx context.Context, id string) (*domain.Workflow, error)
+ 	Save(ctx context.Context, workflow *domain.Workflow) (*domain.Workflow, error)
++	SaveDraft(ctx context.Context, workflowId string, graph *domain.WorkflowGraph, baseDraftVersion int) (*domain.Workflow, error)
++	PublishDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error)
++	RollbackDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error)
+ }
+ 
+ type workflowRunRepository interface {
+diff --git a/migrations/1791849600_upgrade_v0.4.36.go b/migrations/1791849600_upgrade_v0.4.36.go
+new file mode 100644
+index 00000000..db6fd2e0
+--- /dev/null
++++ b/migrations/1791849600_upgrade_v0.4.36.go
+@@ -0,0 +1,68 @@
++package migrations
++
++import (
++	"errors"
++
++	"github.com/pocketbase/pocketbase/core"
++	m "github.com/pocketbase/pocketbase/migrations"
++)
++
++func init() {
++	m.Register(func(app core.App) error {
++		tracer := NewTracer("v0.4.36")
++		tracer.Printf("go ...")
++
++		// update collection `workflow`
++		//   - add field `draftVersion` (草稿代际，仅保存草稿/发布/回滚时推进)
++		//   - add field `contentVersion` (已发布代际，仅发布成功时推进)
++		{
++			collection, err := app.FindCollectionByNameOrId("tovyif5ax6j62ur")
++			if err != nil {
++				return err
++			}
++
++			if collection.Fields.GetByName("draftVersion") == nil {
++				if err := collection.Fields.AddMarshaledJSONAt(len(collection.Fields), []byte(`{
++					"hidden": false,
++					"id": "drftver1",
++					"max": null,
++					"min": 0,
++					"name": "draftVersion",
++					"onlyInt": true,
++					"presentable": false,
++					"required": false,
++					"system": false,
++					"type": "number"
++				}`)); err != nil {
++					return err
++				}
++			}
++
++			if collection.Fields.GetByName("contentVersion") == nil {
++				if err := collection.Fields.AddMarshaledJSONAt(len(collection.Fields), []byte(`{
++					"hidden": false,
++					"id": "contver1",
++					"max": null,
++					"min": 0,
++					"name": "contentVersion",
++					"onlyInt": true,
++					"presentable": false,
++					"required": false,
++					"system": false,
++					"type": "number"
++				}`)); err != nil {
++					return err
++				}
++			}
++
++			if err := app.Save(collection); err != nil {
++				return err
++			}
++		}
++
++		tracer.Printf("done")
++		return nil
++	}, func(app core.App) error {
++		return errors.ErrUnsupported
++	})
++}
+diff --git a/ui/src/api/workflows.ts b/ui/src/api/workflows.ts
+index e9c12b59..92403a96 100644
+--- a/ui/src/api/workflows.ts
++++ b/ui/src/api/workflows.ts
+@@ -1,4 +1,4 @@
+-import { WORKFLOW_TRIGGERS } from "@/domain/workflow";
++import { WORKFLOW_TRIGGERS, type WorkflowGraph, type WorkflowModel } from "@/domain/workflow";
+ 
+ import { get as httpGet, post as httpPost } from "./_api";
+ 
+@@ -14,6 +14,37 @@ export const getStats = () => {
+   });
+ };
+ 
++// 保存草稿：仅推进 baseDraftVersion 所指向的草稿代际；版本落后时服务端返回 409
++export const saveWorkflowDraft = (workflowId: string, data: { graph: WorkflowGraph; baseDraftVersion: number }) => {
++  return httpPost<WorkflowModel>({
++    url: `/api/workflows/${encodeURIComponent(workflowId)}/draft`,
++    body: {
++      graph: data.graph,
++      baseDraftVersion: data.baseDraftVersion,
++    },
++  });
++};
++
++// 发布：服务端原子校验草稿代际，并把图、触发方式、定时表达式作为同一个已发布代提交
++export const publishWorkflowDraft = (workflowId: string, data: { baseDraftVersion: number }) => {
++  return httpPost<WorkflowModel>({
++    url: `/api/workflows/${encodeURIComponent(workflowId)}/publish`,
++    body: {
++      baseDraftVersion: data.baseDraftVersion,
++    },
++  });
++};
++
++// 回滚：用服务端当前已发布内容重置草稿，同样要求草稿代际匹配
++export const rollbackWorkflowDraft = (workflowId: string, data: { baseDraftVersion: number }) => {
++  return httpPost<WorkflowModel>({
++    url: `/api/workflows/${encodeURIComponent(workflowId)}/rollback`,
++    body: {
++      baseDraftVersion: data.baseDraftVersion,
++    },
++  });
++};
++
+ export const startRun = (workflowId: string) => {
+   return httpPost({
+     url: `/api/workflows/${encodeURIComponent(workflowId)}/runs`,
+diff --git a/ui/src/domain/workflow.ts b/ui/src/domain/workflow.ts
+index 0380a8c5..9434a3ac 100644
+--- a/ui/src/domain/workflow.ts
++++ b/ui/src/domain/workflow.ts
+@@ -14,6 +14,10 @@ export interface WorkflowModel extends BaseModel {
+   graphContent?: WorkflowGraph;
+   hasDraft?: boolean;
+   hasContent?: boolean;
++  /** 草稿代际：每次草稿保存/发布/回滚由服务端推进，写入时必须回传所基于的值 */
++  draftVersion?: number;
++  /** 已发布代际：每次发布成功由服务端推进 */
++  contentVersion?: number;
+   lastRunRef?: string;
+   lastRunStatus?: string;
+   lastRunTime?: string;
+diff --git a/ui/src/i18n/resources/en/nls.workflow.json b/ui/src/i18n/resources/en/nls.workflow.json
+index 1426eb32..c9b38440 100644
+--- a/ui/src/i18n/resources/en/nls.workflow.json
++++ b/ui/src/i18n/resources/en/nls.workflow.json
+@@ -198,6 +198,13 @@
+       "uncompleted_design": {
+         "alert": "The orchestration is not ready. Please check if there are any nodes not configured."
+       },
++      "conflict": {
++        "modal": {
++          "title": "Workflow updated by another administrator",
++          "content": "The draft or published version has been changed by someone else. Your local changes can no longer be saved or published and will not overwrite the newer version. The page will reload so you can continue editing on the latest version.",
++          "ok_button": "Reload now"
++        }
++      },
+       "unpublished_draft": {
+         "alert": "The orchestration is not released yet."
+       },
+diff --git a/ui/src/i18n/resources/zh/nls.workflow.json b/ui/src/i18n/resources/zh/nls.workflow.json
+index 4199b96e..1e4b0c4e 100644
+--- a/ui/src/i18n/resources/zh/nls.workflow.json
++++ b/ui/src/i18n/resources/zh/nls.workflow.json
+@@ -198,6 +198,13 @@
+       "uncompleted_design": {
+         "alert": "流程编排未就绪，请检查是否有节点未完成配置。"
+       },
++      "conflict": {
++        "modal": {
++          "title": "工作流已被其他管理员更新",
++          "content": "该工作流的草稿或已发布版本已被他人修改，你本地的更改无法再保存或发布，也不会覆盖服务器上的新版本。页面将重新加载，之后可在最新版本上继续编辑。",
++          "ok_button": "立即重新加载"
++        }
++      },
+       "unpublished_draft": {
+         "alert": "当前编排有尚未发布的更改。"
+       },
+diff --git a/ui/src/pages/workflows/WorkflowDetailDesign.tsx b/ui/src/pages/workflows/WorkflowDetailDesign.tsx
+index d9a7d3df..8ac4ab63 100644
+--- a/ui/src/pages/workflows/WorkflowDetailDesign.tsx
++++ b/ui/src/pages/workflows/WorkflowDetailDesign.tsx
+@@ -12,7 +12,7 @@ import WorkflowGraphExportModal from "@/components/workflow/WorkflowGraphExportM
+ import WorkflowGraphImportModal from "@/components/workflow/WorkflowGraphImportModal";
+ import { useAppSettings, useZustandShallowSelector } from "@/hooks";
+ import { useWorkflowStore } from "@/stores/workflow";
+-import { unwrapErrMsg } from "@/utils/error";
++import { isWorkflowVersionConflictError, unwrapErrMsg } from "@/utils/error";
+ 
+ const WorkflowDetailDesign = () => {
+   const { t } = useTranslation();
+@@ -29,7 +29,34 @@ const WorkflowDetailDesign = () => {
+ 
+   const designerRef = useRef<WorkflowDesignerInstance>(null);
+   const designerPending = useRef(false); // 保存中时阻止刷新画布
++  // 检测到他人已推进版本后置位：不再自动保存/重试，仅允许用户重新加载后继续编辑
++  const versionConflictRef = useRef(false);
+   const [designerError, setDesignerError] = useState<unknown>();
++
++  const showVersionConflictModal = () => {
++    modal.warning({
++      title: t("workflow.detail.design.conflict.modal.title"),
++      content: t("workflow.detail.design.conflict.modal.content"),
++      okText: t("workflow.detail.design.conflict.modal.ok_button"),
++      cancelButtonProps: { style: { display: "none" } },
++      onOk: () => {
++        window.location.reload();
++      },
++    });
++  };
++
++  // 冲突错误：明确提示并引导刷新，保留服务端新草稿/已发布内容，不做静默合并或重试覆盖
++  const handleActionError = (err: unknown) => {
++    console.error(err);
++    if (isWorkflowVersionConflictError(err)) {
++      versionConflictRef.current = true;
++      showVersionConflictModal();
++      return;
++    }
++
++    notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++  };
++
+   useDeepCompareEffect(() => {
+     if (designerRef.current == null || designerRef.current.document.disposed) return;
+     if (designerPending.current) return;
+@@ -48,20 +75,25 @@ const WorkflowDetailDesign = () => {
+ 
+   const handleDesignerDocumentChange = debounce({ delay: 300 }, async () => {
+     if (designerRef.current == null || designerRef.current.document.disposed) return;
++    if (versionConflictRef.current) return;
+ 
+     designerPending.current = true;
+     try {
+       const graph = designerRef.current!.document.toJSON();
+       await workflowStore.orchestrate(graph);
+     } catch (err) {
+-      console.error(err);
+-      notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++      handleActionError(err);
+     } finally {
+       designerPending.current = false;
+     }
+   });
+ 
+   const handleRollbackClick = () => {
++    if (versionConflictRef.current) {
++      showVersionConflictModal();
++      return;
++    }
++
+     modal.confirm({
+       title: t("workflow.detail.design.action.rollback.modal.title"),
+       content: t("workflow.detail.design.action.rollback.modal.content"),
+@@ -71,14 +103,18 @@ const WorkflowDetailDesign = () => {
+ 
+           message.success(t("common.text.operation_succeeded"));
+         } catch (err) {
+-          console.error(err);
+-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++          handleActionError(err);
+         }
+       },
+     });
+   };
+ 
+   const handlePublishClick = async () => {
++    if (versionConflictRef.current) {
++      showVersionConflictModal();
++      return;
++    }
++
+     if (!(await designerRef.current!.validateAllNodes())) {
+       message.warning(t("workflow.detail.design.uncompleted_design.alert"));
+       return;
+@@ -93,8 +129,7 @@ const WorkflowDetailDesign = () => {
+ 
+           message.success(t("common.text.operation_succeeded"));
+         } catch (err) {
+-          console.error(err);
+-          notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++          handleActionError(err);
+         }
+       },
+     });
+@@ -104,6 +139,11 @@ const WorkflowDetailDesign = () => {
+   const { modalProps: graphExportModalProps, ...graphExportModal } = WorkflowGraphExportModal.useModal();
+ 
+   const handleImportClick = async () => {
++    if (versionConflictRef.current) {
++      showVersionConflictModal();
++      return;
++    }
++
+     graphImportModal.open().then(async (graph) => {
+       const loadingKey = Math.random().toString(36).substring(0, 8);
+       message.loading({ key: loadingKey, content: t("common.text.saving"), duration: 0 });
+@@ -114,9 +154,8 @@ const WorkflowDetailDesign = () => {
+         message.destroy(loadingKey);
+         message.success(t("common.text.operation_succeeded"));
+       } catch (err) {
+-        console.error(err);
+         message.destroy(loadingKey);
+-        notification.error({ title: t("common.text.request_error"), description: unwrapErrMsg(err) });
++        handleActionError(err);
+       }
+     });
+   };
+diff --git a/ui/src/stores/workflow/index.ts b/ui/src/stores/workflow/index.ts
+index 99b1fdc3..8be11330 100644
+--- a/ui/src/stores/workflow/index.ts
++++ b/ui/src/stores/workflow/index.ts
+@@ -1,12 +1,15 @@
+ import { produce } from "immer";
+-import { isEqual } from "radash";
+ import { create } from "zustand";
+ 
+-import { WORKFLOW_NODE_TYPES, type WorkflowModel, type WorkflowNodeConfigForStart } from "@/domain/workflow";
++import { publishWorkflowDraft, rollbackWorkflowDraft, saveWorkflowDraft } from "@/api/workflows";
++import { WORKFLOW_NODE_TYPES, type WorkflowModel } from "@/domain/workflow";
+ import { get as getWorkflow, save as saveWorkflow, subscribe as subscribeWorkflow } from "@/repository/workflow";
+ 
+ import { type WorkflowStore } from "./types";
+ 
++// 实时事件只允许同步这些与编排编辑无关的元数据字段，
++// 避免他人的保存/发布静默替换当前编辑会话所基于的草稿代际。
++
+ export const useWorkflowStore = create<WorkflowStore>((set, get) => {
+   const ensureInitialized = () => {
+     if (!get().initialized) throw "Workflow not initialized yet";
+@@ -28,9 +31,20 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => {
+       unsubscriber ??= await subscribeWorkflow(id, (cb) => {
+         if (cb.record.id !== get().workflow.id) return;
+ 
+-        set({
+-          workflow: cb.record,
+-        });
++        set((state) => ({
++          workflow: produce(state.workflow, (draft) => {
++            // 编排相关字段（graphDraft/graphContent/hasDraft/hasContent/trigger/版本号等）不随实时事件覆盖，
++            // 避免他人的变更静默并入当前编辑会话；版本落后时由服务端在下一次写入时返回冲突。
++            draft.name = cb.record.name;
++            draft.description = cb.record.description;
++            draft.enabled = cb.record.enabled;
++            draft.lastRunRef = cb.record.lastRunRef;
++            draft.lastRunStatus = cb.record.lastRunStatus;
++            draft.lastRunTime = cb.record.lastRunTime;
++            draft.expand = cb.record.expand;
++            draft.updated = cb.record.updated;
++          }),
++        }));
+       });
+     },
+ 
+@@ -98,17 +112,18 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => {
+     orchestrate: async (graph) => {
+       ensureInitialized();
+ 
+-      const resp = await saveWorkflow({
+-        id: get().workflow.id!,
+-        graphDraft: graph,
+-        hasDraft: !isEqual(graph, get().workflow.graphContent),
++      // 只能推进当前编辑会话实际读取到的草稿代际；冲突时抛出错误，不静默合并或重试
++      const resp = await saveWorkflowDraft(get().workflow.id!, {
++        graph,
++        baseDraftVersion: get().workflow.draftVersion ?? 0,
+       });
+ 
+       set((state) => {
+         return {
+           workflow: produce(state.workflow, (draft) => {
+-            draft.graphDraft = resp.graphDraft;
+-            draft.hasDraft = resp.hasDraft;
++            draft.graphDraft = resp.data.graphDraft;
++            draft.hasDraft = resp.data.hasDraft;
++            draft.draftVersion = resp.data.draftVersion;
+           }),
+         };
+       });
+@@ -119,24 +134,22 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => {
+ 
+       const graph = get().workflow.graphDraft!;
+       if (graph?.nodes?.[0]?.type !== WORKFLOW_NODE_TYPES.START) throw "Workflow nodes tree of draft in invalid";
+-      const startConfig = graph.nodes[0].data.config as WorkflowNodeConfigForStart;
+-      const resp = await saveWorkflow({
+-        id: get().workflow.id!,
+-        trigger: startConfig.trigger,
+-        triggerCron: startConfig.triggerCron,
+-        graphContent: graph,
+-        hasContent: true,
+-        hasDraft: false,
++
++      const resp = await publishWorkflowDraft(get().workflow.id!, {
++        baseDraftVersion: get().workflow.draftVersion ?? 0,
+       });
+ 
+       set((state) => {
+         return {
+           workflow: produce(state.workflow, (draft) => {
+-            draft.trigger = resp.trigger;
+-            draft.triggerCron = resp.triggerCron;
+-            draft.graphContent = resp.graphContent;
+-            draft.hasContent = resp.hasContent;
+-            draft.hasDraft = resp.hasDraft;
++            draft.trigger = resp.data.trigger;
++            draft.triggerCron = resp.data.triggerCron;
++            draft.graphDraft = resp.data.graphDraft;
++            draft.graphContent = resp.data.graphContent;
++            draft.hasContent = resp.data.hasContent;
++            draft.hasDraft = resp.data.hasDraft;
++            draft.draftVersion = resp.data.draftVersion;
++            draft.contentVersion = resp.data.contentVersion;
+           }),
+         };
+       });
+@@ -145,26 +158,20 @@ export const useWorkflowStore = create<WorkflowStore>((set, get) => {
+     rollback: async () => {
+       ensureInitialized();
+ 
+-      const graph = get().workflow.graphContent!;
+-      if (graph?.nodes?.[0]?.type !== WORKFLOW_NODE_TYPES.START) throw "Workflow nodes tree of content in invalid";
+-      const startConfig = graph.nodes[0].data.config as WorkflowNodeConfigForStart;
+-      const resp = await saveWorkflow({
+-        id: get().workflow.id!,
+-        trigger: startConfig.trigger,
+-        triggerCron: startConfig.triggerCron,
+-        hasContent: true,
+-        graphDraft: graph,
+-        hasDraft: false,
++      if (get().workflow.graphContent?.nodes?.[0]?.type !== WORKFLOW_NODE_TYPES.START) throw "Workflow nodes tree of content in invalid";
++
++      const resp = await rollbackWorkflowDraft(get().workflow.id!, {
++        baseDraftVersion: get().workflow.draftVersion ?? 0,
+       });
+ 
+       set((state) => {
+         return {
+           workflow: produce(state.workflow, (draft) => {
+-            draft.trigger = resp.trigger;
+-            draft.triggerCron = resp.triggerCron;
+-            draft.hasContent = resp.hasContent;
+-            draft.graphDraft = resp.graphDraft;
+-            draft.hasDraft = resp.hasDraft;
++            draft.trigger = resp.data.trigger;
++            draft.triggerCron = resp.data.triggerCron;
++            draft.graphDraft = resp.data.graphDraft;
++            draft.hasDraft = resp.data.hasDraft;
++            draft.draftVersion = resp.data.draftVersion;
+           }),
+         };
+       });
+diff --git a/ui/src/utils/error.ts b/ui/src/utils/error.ts
+index 141e8d20..a7b21f4a 100644
+--- a/ui/src/utils/error.ts
++++ b/ui/src/utils/error.ts
+@@ -17,3 +17,19 @@ export const unwrapErrMsg = (error: unknown): string => {
+ 
+   return "Unknown error";
+ };
++
++// 工作流草稿代际冲突的业务码，与后端 domain.ErrWorkflowVersionConflict / 记录更新守卫保持一致
++export const WORKFLOW_VERSION_CONFLICT_CODE = 409;
++
++// 识别"他人已更新工作流"的冲突结果：
++// - 版本化接口业务错误：HTTP 200，响应体 code=409（被 _api 包装为 status=409 的 ClientResponseError）
++// - 通用记录更新守卫：HTTP 409
++export const isWorkflowVersionConflictError = (error: unknown): boolean => {
++  if (error instanceof ClientResponseError) {
++    if (error.status === WORKFLOW_VERSION_CONFLICT_CODE) return true;
++    const resp = error.response as { code?: unknown; data?: { code?: string } } | undefined;
++    if (resp?.code === WORKFLOW_VERSION_CONFLICT_CODE) return true;
++    if (resp?.data?.code === "WORKFLOW_VERSION_CONFLICT") return true;
++  }
++  return false;
++};

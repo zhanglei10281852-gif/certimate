@@ -130,6 +130,76 @@ func (s *WorkflowService) CancelRun(ctx context.Context, req *dtos.WorkflowCance
 	return &dtos.WorkflowCancelRunResp{}, nil
 }
 
+// SaveDraft 基于客户端读取到的草稿代际保存草稿。
+// 版本冲突时透传 ErrWorkflowVersionConflict，不做静默合并或服务端重试。
+func (s *WorkflowService) SaveDraft(ctx context.Context, req *dtos.WorkflowSaveDraftReq) (*domain.Workflow, error) {
+	if req.Graph == nil {
+		return nil, domain.ErrInvalidParams
+	}
+	if req.BaseDraftVersion < 0 {
+		return nil, domain.ErrInvalidParams
+	}
+
+	workflow, err := s.workflowRepo.SaveDraft(ctx, req.WorkflowId, req.Graph, req.BaseDraftVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	return workflow, nil
+}
+
+// PublishDraft 原子发布对应草稿代：校验草稿版本、图与触发配置，
+// 成功提交后才把新的触发方式/定时表达式同步到定时调度；失败时调度与新运行仍使用上一份完整发布版本。
+func (s *WorkflowService) PublishDraft(ctx context.Context, req *dtos.WorkflowPublishDraftReq) (*domain.Workflow, error) {
+	if req.BaseDraftVersion < 0 {
+		return nil, domain.ErrInvalidParams
+	}
+
+	workflow, err := s.workflowRepo.PublishDraft(ctx, req.WorkflowId, req.BaseDraftVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	// 仅在事务提交成功后切换定时任务，保证不会出现"新调度 + 旧快照"的中间状态
+	s.syncSchedule(workflow)
+
+	return workflow, nil
+}
+
+// RollbackDraft 基于客户端读取到的草稿代际回滚到当前已发布内容。
+func (s *WorkflowService) RollbackDraft(ctx context.Context, req *dtos.WorkflowRollbackDraftReq) (*domain.Workflow, error) {
+	if req.BaseDraftVersion < 0 {
+		return nil, domain.ErrInvalidParams
+	}
+
+	workflow, err := s.workflowRepo.RollbackDraft(ctx, req.WorkflowId, req.BaseDraftVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	s.syncSchedule(workflow)
+
+	return workflow, nil
+}
+
+// syncSchedule 依据已提交的持久状态重建该工作流的定时任务：
+// 停用或手动触发时移除任务，启用且定时触发时按最新表达式（重新）注册。
+func (s *WorkflowService) syncSchedule(workflow *domain.Workflow) {
+	scheduler := app.GetScheduler()
+	jobKey := buildPbJobKey(workflow.Id)
+
+	if !workflow.Enabled || workflow.Trigger != domain.WorkflowTriggerTypeScheduled {
+		scheduler.Remove(jobKey)
+		return
+	}
+
+	if err := registerWorkflowJob(s, workflow.Id, workflow.TriggerCron); err != nil {
+		// 表达式已在发布事务中校验通过，此处失败只可能是暂时故障；
+		// 重启时 InitSchedule 会依据持久状态重建任务，不影响已提交快照的完整性。
+		app.GetLogger().Error(fmt.Sprintf("failed to sync cron job after workflow #%s commit", workflow.Id), slog.Any("error", err))
+	}
+}
+
 func (s *WorkflowService) Shutdown(ctx context.Context) {
 	s.dispatcher.Shutdown(ctx)
 }

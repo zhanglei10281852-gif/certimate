@@ -12,6 +12,9 @@ type workflowRepository interface {
 	ListEnabledScheduled(ctx context.Context) ([]*domain.Workflow, error)
 	GetById(ctx context.Context, id string) (*domain.Workflow, error)
 	Save(ctx context.Context, workflow *domain.Workflow) (*domain.Workflow, error)
+	SaveDraft(ctx context.Context, workflowId string, graph *domain.WorkflowGraph, baseDraftVersion int) (*domain.Workflow, error)
+	PublishDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error)
+	RollbackDraft(ctx context.Context, workflowId string, baseDraftVersion int) (*domain.Workflow, error)
 }
 
 type workflowRunRepository interface {
